@@ -203,7 +203,9 @@ impl Provider for S3 {
     }
 
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error> {
-        let (hash, file) = make_data_tempfile(data).await?;
+        let mut digest = Sha256::new();
+        let file = make_data_tempfile(data, Some(&mut digest)).await?;
+        let hash = format!("{:x}", digest.finalize());
         let body = stream_body(file_reader(file, None));
         self.client
             .put_object()
@@ -259,7 +261,9 @@ impl Provider for LocalDir {
     }
 
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error> {
-        let (hash, file) = make_data_tempfile(data).await?;
+        let mut digest = Sha256::new();
+        let file = make_data_tempfile(data, Some(&mut digest)).await?;
+        let hash = format!("{:x}", digest.finalize());
         let key = hash_path(&hash)?;
         let path = self.dir.join(key);
         task::spawn_blocking(move || atomic_copy(file, path))
@@ -292,7 +296,7 @@ impl<C: Connect + Clone + Send + Sync + 'static> Provider for Remote<C> {
     }
 
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error> {
-        let (_, file) = make_data_tempfile(data).await?;
+        let file = make_data_tempfile(data, None).await?;
         let file = Arc::new(file);
         self.client
             .put(|| async { Ok(stream_body(file_reader(Arc::clone(&file), None))) })
@@ -300,23 +304,27 @@ impl<C: Connect + Clone + Send + Sync + 'static> Provider for Remote<C> {
     }
 }
 
-/// Stream data from a source into a temporary file and compute its hash.
-async fn make_data_tempfile(mut data: ReadStream<'_>) -> anyhow::Result<(String, File)> {
+/// Stream data from a source into a temporary file and optionally compute the
+/// data stream's hash.
+async fn make_data_tempfile(
+    mut data: ReadStream<'_>,
+    mut digest: Option<&mut Sha256>,
+) -> anyhow::Result<File> {
     let mut file = task::spawn_blocking(tempfile).await??;
-    let mut hash = Sha256::new();
     loop {
         let mut buf = Vec::with_capacity(1 << 21);
         let size = data.read_buf(&mut buf).await?;
         if size == 0 {
             break;
         }
-        hash.update(&buf);
+        if let Some(ref mut d) = digest {
+            d.update(&buf);
+        }
         // Hack needed for ownership issues with spawn_blocking being 'static.
         file = task::spawn_blocking(move || file.write_all(&buf).map(|_| file)).await??;
     }
-    let hash = format!("{:x}", hash.finalize());
     file = task::spawn_blocking(move || file.rewind().map(|_| file)).await??;
-    Ok((hash, file))
+    Ok(file)
 }
 
 fn check_range(range: BlobRange) -> Result<(), Error> {
