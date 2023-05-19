@@ -8,8 +8,11 @@ use blobnet::statsd;
 use clap::Parser;
 use hyper::server::conn::AddrIncoming;
 use hyperlocal::SocketIncoming;
+use shadow_rs::shadow;
 use shutdown::Shutdown;
 use tikv_jemallocator::Jemalloc;
+
+shadow!(build);
 
 /// Low-latency, content-addressed file server with a non-volatile cache.
 ///
@@ -21,7 +24,7 @@ use tikv_jemallocator::Jemalloc;
 /// Files are keyed by their content hashes, and the cache is meant to be
 /// considered volatile at all times.
 #[derive(Parser, Debug)]
-#[clap(version, about, long_about = None)]
+#[clap(version, about, long_about = None, long_version = Some(build::CLAP_LONG_VERSION))]
 pub struct Cli {
     /// String representation of the data provider.
     #[clap(short, long)]
