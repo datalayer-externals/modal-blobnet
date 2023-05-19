@@ -74,7 +74,10 @@ async fn parse_provider(source: &str) -> Result<Box<dyn Provider>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tikv_jemalloc_ctl::background_thread::write(true).unwrap();
+    #[cfg(not(target_os = "macos"))]
+    {
+        tikv_jemalloc_ctl::background_thread::write(true).unwrap();
+    }
 
     let args = Cli::parse();
 
