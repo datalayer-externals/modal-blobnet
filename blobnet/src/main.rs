@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use blobnet::provider::{self, Provider};
 use blobnet::server::{self, Config};
+use blobnet::statsd;
 use clap::Parser;
 use hyper::server::conn::AddrIncoming;
 use hyperlocal::SocketIncoming;
@@ -45,6 +46,10 @@ pub struct Cli {
     /// Listen on a Unix domain socket instead of `port`.
     #[clap(short, long)]
     pub unix_socket: Option<PathBuf>,
+
+    /// Emit metrics to StatsD at 127.0.0.1:8125
+    #[clap(long)]
+    pub statsd: bool,
 }
 
 #[global_allocator]
@@ -73,6 +78,8 @@ async fn main() -> Result<()> {
 
     let args = Cli::parse();
 
+    statsd::try_init(args.statsd)?;
+
     let mut provider = parse_provider(&args.source).await?;
 
     if let Some(fallback) = args.fallback {
@@ -84,6 +91,7 @@ async fn main() -> Result<()> {
         // Server cache has 2 MiB page size.
         let caching = provider::Cached::new(provider, cache, 1 << 21);
         tokio::spawn(caching.cleaner());
+        tokio::spawn(caching.stats_logger());
         tokio::spawn(caching.stats_emitter());
         provider = Box::new(caching);
     }

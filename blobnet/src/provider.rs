@@ -17,6 +17,7 @@ use aws_sdk_s3::{
     error::{GetObjectErrorKind, HeadObjectErrorKind},
     types::SdkError,
 };
+use cadence_macros::*;
 use hashlink::LinkedHashMap;
 use hyper::{body::Bytes, client::connect::Connect};
 use parking_lot::Mutex;
@@ -503,7 +504,13 @@ impl<P: Provider + 'static> Cached<P> {
         async move { state.cleaner().await }
     }
 
-    /// A background process that emits stats
+    /// A background process that logs stats
+    pub fn stats_logger(&self) -> impl Future<Output = ()> {
+        let state = Arc::clone(&self.state);
+        async move { state.stats_logger().await }
+    }
+
+    /// A background process that emits stats to statsd
     pub fn stats_emitter(&self) -> impl Future<Output = ()> {
         let state = Arc::clone(&self.state);
         async move { state.stats_emitter().await }
@@ -720,15 +727,35 @@ impl<P: Provider + 'static> CachedState<P> {
         }
     }
 
-    async fn stats_emitter(&self) {
-        let log_interval = Duration::from_millis(
+    async fn stats_logger(&self) {
+        let interval = Duration::from_millis(
             std::env::var("BLOBNET_STATS_LOG_INTERVAL_MS")
                 .map_or(30_000, |s| s.parse::<u64>().unwrap()),
         );
         loop {
-            time::sleep(log_interval).await;
+            time::sleep(interval).await;
             let stats = self.stats();
             println!("stats: {stats:?}");
+        }
+    }
+
+    async fn stats_emitter(&self) {
+        let interval = Duration::from_millis(
+            std::env::var("BLOBNET_STATS_EMIT_INTERVAL_MS")
+                .map_or(5_000, |s| s.parse::<u64>().unwrap()),
+        );
+        loop {
+            time::sleep(interval).await;
+            let stats = self.stats();
+            statsd_gauge!("blobnet.cache.pending_requests", stats.pending_requests);
+            statsd_gauge!(
+                "blobnet.cache.pending_disk_write_bytes",
+                stats.pending_disk_write_bytes
+            );
+            statsd_gauge!(
+                "blobnet.cache.pending_disk_write_pages",
+                stats.pending_disk_write_pages
+            );
         }
     }
 

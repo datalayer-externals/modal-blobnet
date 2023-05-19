@@ -127,6 +127,8 @@ mod fast_aio;
 pub mod provider;
 pub mod server;
 #[doc(hidden)]
+pub mod statsd;
+#[doc(hidden)]
 pub mod test_provider;
 mod utils;
 
