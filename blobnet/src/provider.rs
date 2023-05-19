@@ -649,58 +649,66 @@ impl<P: Provider + 'static> CachedState<P> {
         F: (Fn(Arc<Self>, String, u64) -> Out) + Send + 'static,
         Out: Future<Output = Result<Bytes, Error>> + Send,
     {
-        let state = self.clone();
-
         self.diskcache_pending_write_pages.fetch_add(1, Relaxed);
         self.diskcache_pending_write_bytes
             .fetch_add(bytes_len, Relaxed);
 
-        tokio::spawn(async move {
-            // Throttle disk writes to not impact user read request latency
-            if let Ok(_permit) = state.diskcache_semaphore.acquire().await {
-                let path = match state.page_disk_path(&hash, n) {
-                    // Bail if the page is already on disk
-                    Ok(path) if fs::metadata(&path).await.is_ok() => return,
-                    Ok(path) => path,
-                    Err(err) => {
-                        eprintln!("error computing page disk path: {err:?}");
-                        return;
-                    }
-                };
-
-                // Get the page from page cache if present
-                let bytes = state.page_cache.lock().peek(hash.clone(), n);
-                let bytes = if let Some(bytes) = bytes {
-                    Some(bytes)
-                } else {
-                    // Fall back to re-fetching the page
-                    let f = func(state.clone(), hash, n);
-                    f.await
-                        .map_err(|err| {
-                            eprintln!("error getting {path:?} cache contents: {err:?}");
-                            err
-                        })
-                        .ok()
-                };
-
-                // Write the page to disk
-                if let Some(bytes) = bytes {
-                    task::spawn_blocking(move || {
-                        let read_buf = Cursor::new(bytes);
-                        if let Err(err) = atomic_copy(read_buf, &path) {
-                            eprintln!("error writing {path:?} cache file: {err:?}");
-                        }
-                    })
-                    .await
-                    .ok();
-                }
-            };
-
+        let state = scopeguard::guard(self.clone(), move |state| {
             state.diskcache_pending_write_pages.fetch_sub(1, Relaxed);
             state
                 .diskcache_pending_write_bytes
                 .fetch_sub(bytes_len, Relaxed);
         });
+
+        tokio::spawn(async move {
+            // Throttle disk writes to not impact user read request latency
+            if let Ok(_permit) = state.diskcache_semaphore.acquire().await {
+                state._populate_disk_cache(hash, n, func).await;
+            }
+        });
+    }
+
+    async fn _populate_disk_cache<F, Out>(self: &Arc<Self>, hash: String, n: u64, func: F)
+    where
+        F: (Fn(Arc<Self>, String, u64) -> Out) + Send + 'static,
+        Out: Future<Output = Result<Bytes, Error>> + Send,
+    {
+        let path = match self.page_disk_path(&hash, n) {
+            // Bail if the page is already on disk
+            Ok(path) if fs::metadata(&path).await.is_ok() => return,
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("error computing page disk path: {err:?}");
+                return;
+            }
+        };
+
+        // Get the page from page cache if present
+        let bytes = self.page_cache.lock().peek(hash.clone(), n);
+        let bytes = if let Some(bytes) = bytes {
+            Some(bytes)
+        } else {
+            // Fall back to re-fetching the page
+            let f = func(self.clone(), hash, n);
+            f.await
+                .map_err(|err| {
+                    eprintln!("error getting {path:?} cache contents: {err:?}");
+                    err
+                })
+                .ok()
+        };
+
+        // Write the page to disk
+        if let Some(bytes) = bytes {
+            task::spawn_blocking(move || {
+                let read_buf = Cursor::new(bytes);
+                if let Err(err) = atomic_copy(read_buf, &path) {
+                    eprintln!("error writing {path:?} cache file: {err:?}");
+                }
+            })
+            .await
+            .ok();
+        }
     }
 
     fn page_disk_path(self: &Arc<Self>, hash: &str, n: u64) -> Result<PathBuf, Error> {

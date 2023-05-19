@@ -491,6 +491,7 @@ dependencies = [
  "named-retry",
  "parking_lot",
  "quickcheck",
+ "scopeguard",
  "sha2",
  "shadow-rs",
  "shutdown",
