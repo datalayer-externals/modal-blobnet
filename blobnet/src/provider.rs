@@ -450,12 +450,16 @@ struct CachedState<P> {
 
 /// Stats of `CachedState`
 #[non_exhaustive]
+#[derive(Debug)]
 pub struct CacheStats {
     /// Number of pages pending writing to disk cache
     pub pending_disk_write_pages: u64,
 
     /// Bytes pending writing to disk cache
     pub pending_disk_write_bytes: u64,
+
+    /// Number of pending requests
+    pub pending_requests: u64,
 }
 
 impl<P: Provider + 'static> Cached<P> {
@@ -499,12 +503,15 @@ impl<P: Provider + 'static> Cached<P> {
         async move { state.cleaner().await }
     }
 
+    /// A background process that emits stats
+    pub fn stats_emitter(&self) -> impl Future<Output = ()> {
+        let state = Arc::clone(&self.state);
+        async move { state.stats_emitter().await }
+    }
+
     /// Get a snapshot of current stats like volume of pending disk writes.
     pub fn stats(&self) -> CacheStats {
-        CacheStats {
-            pending_disk_write_bytes: self.state.diskcache_pending_write_bytes.load(Relaxed),
-            pending_disk_write_pages: self.state.diskcache_pending_write_pages.load(Relaxed),
-        }
+        self.state.stats()
     }
 }
 
@@ -710,6 +717,26 @@ impl<P: Provider + 'static> CachedState<P> {
                     fs::remove_dir_all(&subfolder_tmp).await.ok();
                 }
             }
+        }
+    }
+
+    async fn stats_emitter(&self) {
+        let log_interval = Duration::from_millis(
+            std::env::var("BLOBNET_STATS_LOG_INTERVAL_MS")
+                .map_or(30_000, |s| s.parse::<u64>().unwrap()),
+        );
+        loop {
+            time::sleep(log_interval).await;
+            let stats = self.stats();
+            println!("stats: {stats:?}");
+        }
+    }
+
+    fn stats(&self) -> CacheStats {
+        CacheStats {
+            pending_disk_write_bytes: self.diskcache_pending_write_bytes.load(Relaxed),
+            pending_disk_write_pages: self.diskcache_pending_write_pages.load(Relaxed),
+            pending_requests: self.pending_requests.lock().len() as u64,
         }
     }
 }

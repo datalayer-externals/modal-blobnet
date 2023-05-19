@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
         // Server cache has 2 MiB page size.
         let caching = provider::Cached::new(provider, cache, 1 << 21);
         tokio::spawn(caching.cleaner());
+        tokio::spawn(caching.stats_emitter());
         provider = Box::new(caching);
     }
 
