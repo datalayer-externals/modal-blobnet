@@ -735,7 +735,7 @@ impl<P: Provider + 'static> CachedState<P> {
         loop {
             time::sleep(interval).await;
             let stats = self.stats();
-            println!("stats: {stats:?}");
+            println!("{stats:?}");
         }
     }
 
