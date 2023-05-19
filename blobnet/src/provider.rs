@@ -747,13 +747,13 @@ impl<P: Provider + 'static> CachedState<P> {
         loop {
             time::sleep(interval).await;
             let stats = self.stats();
-            statsd_gauge!("blobnet.cache.pending_requests", stats.pending_requests);
+            statsd_gauge!("cache.pending_requests", stats.pending_requests);
             statsd_gauge!(
-                "blobnet.cache.pending_disk_write_bytes",
+                "cache.pending_disk_write_bytes",
                 stats.pending_disk_write_bytes
             );
             statsd_gauge!(
-                "blobnet.cache.pending_disk_write_pages",
+                "cache.pending_disk_write_pages",
                 stats.pending_disk_write_pages
             );
         }
