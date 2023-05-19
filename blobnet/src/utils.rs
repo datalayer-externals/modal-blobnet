@@ -61,7 +61,7 @@ pub(crate) fn atomic_copy(mut source: impl Read, dest: impl AsRef<Path>) -> Resu
     if fs::metadata(dest).is_err() {
         let parent = dest
             .parent()
-            .ok_or_else(|| anyhow!("parent of destination path {dest:?} does not exist"))?
+            .ok_or_else(|| anyhow!("no parent in destination path {dest:?}"))?
             .to_owned();
 
         fs::create_dir_all(&parent)?;
