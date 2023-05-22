@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Error;
 use blobnet::{
     provider::{self, Provider},
     read_to_bytes,
@@ -12,6 +13,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, SamplingM
 use hyper::body::Bytes;
 use tikv_jemallocator::Jemalloc;
 use tokio::runtime::Runtime;
+use tokio::time;
 use tokio_stream::StreamExt;
 use tokio_util::io::{ReaderStream, StreamReader};
 
@@ -60,7 +62,10 @@ fn bench_insert_read_1k(c: &mut Criterion) {
         });
     });
 
+    drop(runtime);
+
     g.bench_function("cached_localdir", |b| {
+        let runtime = Runtime::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let provider = provider::Cached::new(
             provider::LocalDir::new(dir.path().join("data")),
@@ -71,6 +76,8 @@ fn bench_insert_read_1k(c: &mut Criterion) {
         b.to_async(&runtime).iter(|| async {
             insert_read_1k(&provider).await.unwrap();
         });
+        // Stop async cache population
+        runtime.shutdown_timeout(Duration::from_secs(30));
     });
 
     g.finish();
@@ -106,8 +113,18 @@ async fn image_delayed(
     cache: &Path,
     provider: impl Provider + 'static,
     hashes: &[String],
+    await_cache_population: bool,
 ) -> anyhow::Result<()> {
     let provider = Delayed::new(provider, 400e-6, 12.5);
+    image(cache, provider, hashes, await_cache_population).await
+}
+
+async fn image(
+    cache: &Path,
+    provider: impl Provider + 'static,
+    hashes: &[String],
+    await_cache_population: bool,
+) -> Result<(), Error> {
     let provider = provider::Cached::new(provider, cache, 1 << 21);
 
     for hash in hashes {
@@ -118,12 +135,16 @@ async fn image_delayed(
         }
     }
 
+    if await_cache_population {
+        while provider.stats().pending_disk_write_pages > 0 {
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     Ok(())
 }
 
 fn bench_image_delayed(c: &mut Criterion) {
-    let runtime = Runtime::new().unwrap();
-
     let mut g = c.benchmark_group("image_delayed");
     g.sampling_mode(SamplingMode::Flat);
     g.sample_size(10);
@@ -132,17 +153,23 @@ fn bench_image_delayed(c: &mut Criterion) {
 
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(provider::LocalDir::new(dir.path()));
-    let hashes = runtime.block_on(image_setup(&provider)).unwrap();
+    let hashes = Runtime::new()
+        .unwrap()
+        .block_on(image_setup(&provider))
+        .unwrap();
 
     g.bench_function("cold", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
+                let runtime = Runtime::new().unwrap();
                 let cache_dir = tempfile::tempdir().unwrap();
                 let start = Instant::now();
-                let fut = image_delayed(cache_dir.path(), Arc::clone(&provider), &hashes);
+                let fut = image_delayed(cache_dir.path(), Arc::clone(&provider), &hashes, false);
                 runtime.block_on(fut).unwrap();
                 total += start.elapsed();
+                // Stop async cache population
+                runtime.shutdown_timeout(Duration::from_secs(30));
             }
             total
         })
@@ -151,15 +178,16 @@ fn bench_image_delayed(c: &mut Criterion) {
     let cache_dir = tempfile::tempdir().unwrap();
 
     // Populate the cache for the next test.
+    let runtime = Runtime::new().unwrap();
     runtime.block_on(async {
-        image_delayed(cache_dir.path(), Arc::clone(&provider), &hashes)
+        image(cache_dir.path(), Arc::clone(&provider), &hashes, true)
             .await
             .unwrap();
     });
 
     g.bench_function("warm", |b| {
         b.to_async(&runtime).iter(|| async {
-            image_delayed(cache_dir.path(), Arc::clone(&provider), &hashes)
+            image_delayed(cache_dir.path(), Arc::clone(&provider), &hashes, false)
                 .await
                 .unwrap();
         });
