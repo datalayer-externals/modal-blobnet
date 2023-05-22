@@ -205,7 +205,7 @@ impl Provider for S3 {
 
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error> {
         let mut digest = Sha256::new();
-        let file = make_data_tempfile(data, Some(&mut digest)).await?;
+        let (file, _) = make_data_tempfile(data, Some(&mut digest)).await?;
         let hash = format!("{:x}", digest.finalize());
         let body = stream_body(file_reader(file, None));
         self.client
@@ -263,11 +263,11 @@ impl Provider for LocalDir {
 
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error> {
         let mut digest = Sha256::new();
-        let file = make_data_tempfile(data, Some(&mut digest)).await?;
+        let (file, len) = make_data_tempfile(data, Some(&mut digest)).await?;
         let hash = format!("{:x}", digest.finalize());
         let key = hash_path(&hash)?;
         let path = self.dir.join(key);
-        task::spawn_blocking(move || atomic_copy(file, path))
+        task::spawn_blocking(move || atomic_copy(file, path, len))
             .await
             .map_err(anyhow::Error::from)??;
         Ok(hash)
@@ -297,7 +297,7 @@ impl<C: Connect + Clone + Send + Sync + 'static> Provider for Remote<C> {
     }
 
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error> {
-        let file = make_data_tempfile(data, None).await?;
+        let (file, _) = make_data_tempfile(data, None).await?;
         let file = Arc::new(file);
         self.client
             .put(|| async { Ok(stream_body(file_reader(Arc::clone(&file), None))) })
@@ -310,14 +310,16 @@ impl<C: Connect + Clone + Send + Sync + 'static> Provider for Remote<C> {
 async fn make_data_tempfile(
     mut data: ReadStream<'_>,
     mut digest: Option<&mut Sha256>,
-) -> anyhow::Result<File> {
+) -> anyhow::Result<(File, u64)> {
     let mut file = task::spawn_blocking(tempfile).await??;
+    let mut len = 0;
     loop {
         let mut buf = Vec::with_capacity(1 << 21);
         let size = data.read_buf(&mut buf).await?;
         if size == 0 {
             break;
         }
+        len += size;
         if let Some(ref mut d) = digest {
             d.update(&buf);
         }
@@ -325,7 +327,7 @@ async fn make_data_tempfile(
         file = task::spawn_blocking(move || file.write_all(&buf).map(|_| file)).await??;
     }
     file = task::spawn_blocking(move || file.rewind().map(|_| file)).await??;
-    Ok(file)
+    Ok((file, len as u64))
 }
 
 fn check_range(range: BlobRange) -> Result<(), Error> {
@@ -701,8 +703,9 @@ impl<P: Provider + 'static> CachedState<P> {
         // Write the page to disk
         if let Some(bytes) = bytes {
             task::spawn_blocking(move || {
+                let len = bytes.len() as u64;
                 let read_buf = Cursor::new(bytes);
-                if let Err(err) = atomic_copy(read_buf, &path) {
+                if let Err(err) = atomic_copy(read_buf, &path, len) {
                     eprintln!("error writing {path:?} cache file: {err:?}");
                 }
             })

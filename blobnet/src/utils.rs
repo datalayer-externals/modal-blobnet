@@ -1,7 +1,7 @@
 //! File system and hash utilities used by the file server.
 
 use std::fs;
-use std::io::{self, BufWriter, ErrorKind, Read};
+use std::io::{self, BufWriter, ErrorKind, Read, Write};
 use std::path::Path;
 
 use anyhow::{anyhow, ensure, Result};
@@ -55,7 +55,7 @@ pub(crate) fn hash_path(hash: &str) -> Result<String> {
 ///
 /// Returns `true` if the file was not previously present at the destination and
 /// was written successfully.
-pub(crate) fn atomic_copy(mut source: impl Read, dest: impl AsRef<Path>) -> Result<bool> {
+pub(crate) fn atomic_copy(mut source: impl Read, dest: impl AsRef<Path>, len: u64) -> Result<bool> {
     let dest = dest.as_ref();
 
     if fs::metadata(dest).is_err() {
@@ -67,8 +67,13 @@ pub(crate) fn atomic_copy(mut source: impl Read, dest: impl AsRef<Path>) -> Resu
         fs::create_dir_all(&parent)?;
         let mut file = NamedTempFile::new_in(parent)?;
         {
+            // TODO (dano): use copy_file_range when both source and and dest are files
             let mut writer = BufWriter::with_capacity(1 << 21, &mut file);
-            io::copy(&mut source, &mut writer)?;
+            let n = io::copy(&mut source, &mut writer)?;
+            if n != len {
+                return Err(anyhow!("failed to write full file: {n}/{len}"));
+            }
+            writer.flush()?;
         }
 
         file.as_file().sync_data()?;
@@ -102,7 +107,9 @@ pub(crate) fn body_stream(body: Body) -> ReadStream<'static> {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use std::process::Command;
+
+    use anyhow::{anyhow, Result};
     use tempfile::tempdir;
 
     use super::hash_path;
@@ -135,9 +142,48 @@ mod tests {
             for _ in 0..depth {
                 dst.push(i.to_string());
             }
-            atomic_copy(data.as_slice(), dst).unwrap();
+            atomic_copy(data.as_slice(), dst, data.len() as u64).unwrap();
         }
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_atomic_copy_handles_full_filesystem() -> Result<()> {
+        if let Err(e) = Command::new("sudo").arg("-v").output() {
+            eprintln!("Unable to sudo, skipping test: {e}");
+            return Ok(());
+        }
+
+        // Mount a 32kb tmpfs
+        let dir = tempdir()?;
+        let dirpath = dir.path().to_str().unwrap();
+        Command::new("sudo")
+            .args(["mount", "-t", "tmpfs", "-o", "size=32K", "tmp", dirpath])
+            .output()
+            .expect(&format!("failed to mount tmpfs at {dirpath}"));
+
+        // Attempt to copy a 64kb file into the 32kb tmpfs and check that the copy
+        // failed and that no file was created at the final destination
+        let data = [0_u8; 64 * 1024];
+        let dst = dir.path().join("foo");
+        let res = match atomic_copy(data.as_slice(), &dst, data.len() as u64) {
+            Ok(_) => Err(anyhow!("atomic_copy to full disk should have failed")),
+            Err(_) => {
+                if dst.exists() {
+                    Err(anyhow!("atomic_copy failed but destination file exists"))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+
+        Command::new("sudo")
+            .args(["umount", dirpath])
+            .output()
+            .expect(&format!("failed to umount tmpfs at {dirpath}"));
+
+        res
     }
 }
