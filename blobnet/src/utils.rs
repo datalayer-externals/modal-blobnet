@@ -107,9 +107,12 @@ pub(crate) fn body_stream(body: Body) -> ReadStream<'static> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::process::Command;
 
-    use anyhow::{anyhow, Result};
+    #[cfg(target_os = "linux")]
+    use anyhow::anyhow;
+    use anyhow::Result;
     use tempfile::tempdir;
 
     use super::hash_path;
