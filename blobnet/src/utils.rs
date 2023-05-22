@@ -71,11 +71,10 @@ pub(crate) fn atomic_copy(mut source: impl Read, dest: impl AsRef<Path>) -> Resu
             io::copy(&mut source, &mut writer)?;
         }
 
+        file.as_file().sync_data()?;
+
         match file.persist_noclobber(dest) {
-            Ok(file) => {
-                file.sync_data()?;
-                Ok(true)
-            }
+            Ok(_) => Ok(true),
             Err(err) => {
                 // Ignore error if another caller created the file in the meantime.
                 if err.error.kind() != ErrorKind::AlreadyExists {
@@ -104,8 +103,10 @@ pub(crate) fn body_stream(body: Body) -> ReadStream<'static> {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use tempfile::tempdir;
 
     use super::hash_path;
+    use crate::utils::atomic_copy;
 
     #[test]
     fn test_hash_path() -> Result<()> {
@@ -116,6 +117,27 @@ mod tests {
         assert!(hash_path(&"a".repeat(64)).is_ok());
         assert!(hash_path(&"A".repeat(64)).is_err());
         assert!(hash_path("gk3ipjgpjg2pjog").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_atomic_copy_does_not_fail_on_dir_creation() -> Result<()> {
+        let dir = tempdir()?;
+        let parent = dir.path().to_owned();
+        let mut data = [0_u8; 64 * 1024];
+        for i in 0usize..data.len() {
+            data[i] = (i & 0xff) as u8;
+        }
+
+        for i in 0..1024 {
+            let mut dst = parent.clone();
+            let depth = 1 + (i % 7);
+            for _ in 0..depth {
+                dst.push(i.to_string());
+            }
+            atomic_copy(data.as_slice(), dst).unwrap();
+        }
+
         Ok(())
     }
 }
