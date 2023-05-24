@@ -1,20 +1,22 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use blobnet::client::FileClient;
 use blobnet::provider::Provider;
 use blobnet::server::{listen, Config};
-use blobnet::test_provider;
 use blobnet::test_provider::{MockProvider, Request};
 use blobnet::{provider, read_to_bytes};
+use blobnet::{statsd, test_provider};
 use bytes::Bytes;
 use hyper::client::HttpConnector;
 use hyper::server::conn::AddrIncoming;
+use rand::{self, RngCore};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
+use tokio::process::Command;
 use tokio::{task, time};
 
 type TrackingProvider = test_provider::Tracking<provider::Remote<HttpConnector>>;
@@ -141,6 +143,106 @@ async fn request_cancellation() -> Result<()> {
     // Check that the second request completes
     let r2 = read_to_bytes(f2.await??).await?;
     assert_eq!(r2, Bytes::from(data));
+
+    Ok(())
+}
+
+// #[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_cleaner() -> Result<()> {
+    if let Err(e) = Command::new("sudo").arg("-v").output().await {
+        eprintln!("Unable to sudo, skipping test: {e}");
+        return Ok(());
+    }
+
+    statsd::try_init(false)?;
+
+    const FILE_SIZE: u64 = 4096;
+    const DISK_SIZE: u64 = 1024 * 1024;
+    const CLEANING_THRESHOLD: u64 = (0.8 * DISK_SIZE as f64) as u64;
+
+    // Mount a 1MB tmpfs to use as cache dir
+    let cachedir = scopeguard::guard(tempdir()?, |cachedir| {
+        task::spawn(async move {
+            Command::new("sudo")
+                .args(["umount", "-f"])
+                .arg(cachedir.path())
+                .output()
+                .await
+                .expect(&format!("failed to umount tmpfs at {:?}", cachedir.path()));
+        });
+    });
+    Command::new("sudo")
+        .args(["mount", "-t", "tmpfs", "-o", "size=1M", "tmp"])
+        .arg(cachedir.path())
+        .output()
+        .await
+        .expect(&format!("failed to mount tmpfs at {:?}", cachedir.path()));
+
+    // Set up a cached provider and configure rapid cleaning to speed up test
+    std::env::set_var("BLOBNET_CACHE_CLEAN_INTERVAL_MS", "1");
+    let provider = provider::Memory::new();
+    let cached = scopeguard::guard(
+        provider::Cached::new(provider, cachedir.path(), 4096),
+        move |_| {
+            std::env::remove_var("BLOBNET_CACHE_CLEAN_INTERVAL_MS");
+        },
+    );
+
+    let stats = cached.stats().await;
+    assert_eq!(stats.disk_used_bytes, 0);
+    assert_eq!(stats.disk_total_bytes, 1024 * 1024);
+
+    // Fill disk until just below cleaning threshold
+    while cached.stats().await.disk_used_bytes < (CLEANING_THRESHOLD - 8 * FILE_SIZE) {
+        let mut blob = vec![0u8; FILE_SIZE as usize];
+        rand::thread_rng().fill_bytes(&mut blob);
+        let hash = cached.put(Box::pin(&*blob)).await?;
+        let _ = cached.get(&hash, None).await?;
+    }
+    while cached.stats().await.pending_disk_write_bytes > 0 {
+        time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let stats = cached.stats().await;
+    let disk_used_bytes_before_cleaner_start = stats.disk_used_bytes;
+    assert!(disk_used_bytes_before_cleaner_start < CLEANING_THRESHOLD);
+
+    // Start cleaner and see that it does not delete any files
+    let cleaner = task::spawn(cached.cleaner());
+
+    time::sleep(Duration::from_millis(100)).await;
+    let stats = cached.stats().await;
+    assert_eq!(stats.disk_used_bytes, disk_used_bytes_before_cleaner_start);
+
+    // Stop cleaner
+    cleaner.abort();
+
+    // Fill the disk above cleaning threshold
+    while cached.stats().await.disk_used_bytes < CLEANING_THRESHOLD {
+        let mut blob = vec![0u8; FILE_SIZE as usize];
+        rand::thread_rng().fill_bytes(&mut blob);
+        let hash = cached.put(Box::pin(&*blob)).await?;
+        let _ = cached.get(&hash, None).await?;
+        while cached.stats().await.pending_disk_write_bytes > 0 {
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // Start cleaner again and observe disk usage dropping below threshold
+    task::spawn(cached.cleaner());
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut done = false;
+    while Instant::now() < deadline {
+        let stats = cached.stats().await;
+        if stats.disk_used_bytes <= CLEANING_THRESHOLD {
+            done = true;
+            break;
+        }
+        time::sleep(Duration::from_millis(1000)).await;
+    }
+    assert!(done, "disk usage did not drop below 80% within 10 seconds");
 
     Ok(())
 }

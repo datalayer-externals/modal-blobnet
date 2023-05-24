@@ -136,7 +136,7 @@ async fn image(
     }
 
     if await_cache_population {
-        while provider.stats().pending_disk_write_pages > 0 {
+        while provider.stats().await.pending_disk_write_pages > 0 {
             time::sleep(Duration::from_millis(100)).await;
         }
     }

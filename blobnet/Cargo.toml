@@ -26,6 +26,7 @@ cadence-macros = "0.29.0"
 clap = { version = "4.0.18", features = ["derive", "env"] }
 async-channel = "1.8.0"
 fastrand = "1.8.0"
+fs2 = "0.4.3"
 hashlink = "0.8.1"
 hex = "0.4.3"
 hyper = { version = "0.14.18", features = ["full"] }
@@ -48,6 +49,7 @@ tokio-util = { version = "0.7.4", features = ["io"] }
 [dev-dependencies]
 criterion = { version = "0.4.0", features = ["async_tokio", "html_reports"] }
 quickcheck = "1.0.3"
+rand = { version = "0.8.5", features = ["std", "std_rng"] }
 
 [build-dependencies]
 shadow-rs = "0.21.0"

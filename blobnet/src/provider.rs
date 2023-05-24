@@ -18,6 +18,7 @@ use aws_sdk_s3::{
     types::SdkError,
 };
 use cadence_macros::*;
+use fs2::FsStats;
 use hashlink::LinkedHashMap;
 use hyper::{body::Bytes, client::connect::Connect};
 use parking_lot::Mutex;
@@ -463,6 +464,12 @@ pub struct CacheStats {
 
     /// Number of pending requests
     pub pending_requests: u64,
+
+    /// Size of cache disk in bytes
+    pub disk_total_bytes: u64,
+
+    /// Cache disk usage in bytes
+    pub disk_used_bytes: u64,
 }
 
 impl<P: Provider + 'static> Cached<P> {
@@ -492,15 +499,14 @@ impl<P: Provider + 'static> Cached<P> {
         self.prefetch_depth = n;
     }
 
-    /// A background process that periodically cleans the cache directory.
+    /// A background process that attempts to keep cache disk usage below 80%.
     ///
     /// Since the cache directory is limited in size but local to the machine,
     /// it is acceptable to delete files from this folder at any time.
-    /// Therefore, we can simply remove 1/(256^2) of all files at an
-    /// interval of 60 seconds.
     ///
-    /// Doing the math, it would take (256^2) / 60 / 24 = ~46 days on average to
-    /// expire any given file from the disk cache directory.
+    /// The process monitors the utilization level of the disk that the cache
+    /// directory is on and removes random files from the cache when
+    /// utilization exceeds 80%.
     pub fn cleaner(&self) -> impl Future<Output = ()> {
         let state = Arc::clone(&self.state);
         async move { state.cleaner().await }
@@ -519,8 +525,8 @@ impl<P: Provider + 'static> Cached<P> {
     }
 
     /// Get a snapshot of current stats like volume of pending disk writes.
-    pub fn stats(&self) -> CacheStats {
-        self.state.stats()
+    pub async fn stats(&self) -> CacheStats {
+        self.state.stats().await
     }
 }
 
@@ -721,21 +727,58 @@ impl<P: Provider + 'static> CachedState<P> {
     }
 
     async fn cleaner(&self) {
-        const CLEAN_INTERVAL: Duration = Duration::from_secs(30);
+        let interval = Duration::from_millis(
+            std::env::var("BLOBNET_CACHE_CLEAN_INTERVAL_MS")
+                .map_or(5_000, |s| s.parse::<u64>().unwrap()),
+        );
         loop {
-            time::sleep(CLEAN_INTERVAL).await;
-            let prefix = fastrand::u16(..);
-            let (d1, d2) = (prefix / 256, prefix % 256);
-            let subfolder = self.dir.join(format!("{d1:x}/{d2:x}"));
-            if fs::metadata(&subfolder).await.is_ok() {
-                println!("cleaning cache directory: {}", subfolder.display());
-                let subfolder_tmp = self.dir.join(format!("{d1:x}/.tmp-{d2:x}"));
-                fs::remove_dir_all(&subfolder_tmp).await.ok();
-                if fs::rename(&subfolder, &subfolder_tmp).await.is_ok() {
-                    fs::remove_dir_all(&subfolder_tmp).await.ok();
-                }
+            time::sleep(interval).await;
+            if let Err(e) = self.try_clean().await {
+                eprintln!("cleaner failure: {e}");
             }
         }
+    }
+
+    async fn try_clean(&self) -> anyhow::Result<()> {
+        const THRESHOLD: f64 = 0.80;
+
+        while self.disk_used_fraction().await? > THRESHOLD {
+            self.random_clean().await;
+        }
+
+        Ok(())
+    }
+
+    async fn random_clean(&self) {
+        let prefix = fastrand::u16(..);
+        let (d1, d2) = (prefix / 256, prefix % 256);
+        let subfolder = self.dir.join(format!("{d1:x}/{d2:x}"));
+        if fs::metadata(&subfolder).await.is_ok() {
+            println!("cleaning cache directory: {}", subfolder.display());
+            let subfolder_tmp = self.dir.join(format!("{d1:x}/.tmp-{d2:x}"));
+            fs::remove_dir_all(&subfolder_tmp).await.ok();
+            if fs::rename(&subfolder, &subfolder_tmp).await.is_ok() {
+                fs::remove_dir_all(&subfolder_tmp).await.ok();
+            }
+        }
+    }
+
+    async fn disk_used_fraction(&self) -> anyhow::Result<f64> {
+        let statvfs = self.statvfs().await?;
+        let free_space = statvfs.free_space();
+        let total_space = statvfs.total_space();
+        let used_space = total_space - free_space;
+        let disk_used_fraction = used_space as f64 / total_space as f64;
+        statsd_gauge!("cache.disk_used", disk_used_fraction);
+        statsd_gauge!("cache.disk_used_bytes", used_space);
+        statsd_gauge!("cache.disk_free_bytes", free_space);
+        statsd_gauge!("cache.disk_total_bytes", total_space);
+        Ok(disk_used_fraction)
+    }
+
+    async fn statvfs(&self) -> anyhow::Result<FsStats> {
+        let dir = self.dir.clone();
+        Ok(task::spawn_blocking(move || fs2::statvfs(dir)).await??)
     }
 
     async fn stats_logger(&self) {
@@ -745,7 +788,7 @@ impl<P: Provider + 'static> CachedState<P> {
         );
         loop {
             time::sleep(interval).await;
-            let stats = self.stats();
+            let stats = self.stats().await;
             println!("{stats:?}");
         }
     }
@@ -757,7 +800,7 @@ impl<P: Provider + 'static> CachedState<P> {
         );
         loop {
             time::sleep(interval).await;
-            let stats = self.stats();
+            let stats = self.stats().await;
             statsd_gauge!("cache.pending_requests", stats.pending_requests);
             statsd_gauge!(
                 "cache.pending_disk_write_bytes",
@@ -770,11 +813,23 @@ impl<P: Provider + 'static> CachedState<P> {
         }
     }
 
-    fn stats(&self) -> CacheStats {
+    async fn stats(&self) -> CacheStats {
+        let (disk_total_bytes, disk_used_bytes) = match self.statvfs().await {
+            Ok(statvfs) => (
+                statvfs.total_space(),
+                statvfs.total_space() - statvfs.free_space(),
+            ),
+            Err(_) => {
+                eprintln!("unable to get disk stats");
+                (0, 0)
+            }
+        };
         CacheStats {
             pending_disk_write_bytes: self.diskcache_pending_write_bytes.load(Relaxed),
             pending_disk_write_pages: self.diskcache_pending_write_pages.load(Relaxed),
             pending_requests: self.pending_requests.lock().len() as u64,
+            disk_total_bytes,
+            disk_used_bytes,
         }
     }
 }

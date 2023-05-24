@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
         println!("thpt = {:.2} Gbit/s ({:.2} GB/s)", thpt, thpt / 8f64);
 
         if let Some(cache) = cache {
-            let stats = cache.stats();
+            let stats = cache.stats().await;
             let pending_disk_write_pages_mb =
                 stats.pending_disk_write_bytes as f64 / (1 << 20) as f64;
             if stats.pending_disk_write_pages > 0 {
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
                     stats.pending_disk_write_pages, pending_disk_write_pages_mb
                 );
                 for j in 0.. {
-                    if cache.stats().pending_disk_write_pages == 0 {
+                    if cache.stats().await.pending_disk_write_pages == 0 {
                         break;
                     }
                     sleep(Duration::from_millis(10)).await;
