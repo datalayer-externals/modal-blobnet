@@ -91,12 +91,12 @@ async fn handle(config: Arc<Config>, req: Request<Body>) -> Result<Response<Body
         _ => "<unknown>",
     };
 
-    let method = match req.method() {
-        &Method::GET => Method::GET.as_str(),
-        &Method::POST => Method::POST.as_str(),
-        &Method::PUT => Method::PUT.as_str(),
-        &Method::DELETE => Method::DELETE.as_str(),
-        &Method::HEAD => Method::HEAD.as_str(),
+    let method = match *req.method() {
+        Method::GET => Method::GET.as_str(),
+        Method::POST => Method::POST.as_str(),
+        Method::PUT => Method::PUT.as_str(),
+        Method::DELETE => Method::DELETE.as_str(),
+        Method::HEAD => Method::HEAD.as_str(),
         _ => "<other>",
     };
 

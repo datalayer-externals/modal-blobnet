@@ -1,7 +1,7 @@
 use anyhow::Result;
 use blobnet::client::FileClient;
 use blobnet::server::{listen, Config};
-use blobnet::{provider, BlobRead, ReadStream};
+use blobnet::{provider, statsd, BlobRead, ReadStream};
 use hyper::{body::Bytes, server::conn::AddrIncoming, Body};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 
 /// Spawn a temporary file server on localhost, only used for testing.
 async fn spawn_temp_server() -> Result<String> {
+    statsd::try_init(false)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let mut incoming = AddrIncoming::from_listener(listener)?;
