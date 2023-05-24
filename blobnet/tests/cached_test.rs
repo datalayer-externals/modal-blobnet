@@ -147,7 +147,7 @@ async fn request_cancellation() -> Result<()> {
     Ok(())
 }
 
-// #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_cleaner() -> Result<()> {
     if let Err(e) = Command::new("sudo").arg("-v").output().await {
