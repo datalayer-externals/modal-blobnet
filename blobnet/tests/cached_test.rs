@@ -23,6 +23,7 @@ type TrackingProvider = test_provider::Tracking<provider::Remote<HttpConnector>>
 
 /// Spawn a temporary file server on localhost, only used for testing.
 async fn spawn_temp_server() -> Result<Arc<TrackingProvider>> {
+    statsd::try_init(false)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let mut incoming = AddrIncoming::from_listener(listener)?;
