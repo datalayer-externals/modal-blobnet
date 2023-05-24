@@ -50,9 +50,9 @@ pub struct Cli {
     #[clap(short, long)]
     pub unix_socket: Option<PathBuf>,
 
-    /// Emit metrics to StatsD at 127.0.0.1:8125
+    /// Disable StatsD metrics emission. By default emitted to 127.0.0.1:8125.
     #[clap(long)]
-    pub statsd: bool,
+    pub no_statsd: bool,
 }
 
 #[global_allocator]
@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
 
     let args = Cli::parse();
 
-    statsd::try_init(args.statsd)?;
+    statsd::try_init(!args.no_statsd)?;
 
     let mut provider = parse_provider(&args.source).await?;
 
