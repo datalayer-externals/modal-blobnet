@@ -5,10 +5,11 @@ use std::error::Error as StdError;
 use std::future::{self, Future};
 use std::sync::Arc;
 
+use cadence_macros::statsd_meter;
 use hyper::header::HeaderValue;
 use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use hyper::{Body, Method, Request, Response, Server, StatusCode, Version};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::headers::{HEADER_FILE_LENGTH, HEADER_RANGE, HEADER_SECRET};
@@ -81,6 +82,48 @@ where
 
 /// Main service handler for the file server.
 async fn handle(config: Arc<Config>, req: Request<Body>) -> Result<Response<Body>, Response<Body>> {
+    let http_version = match req.version() {
+        Version::HTTP_09 => "http/0.9",
+        Version::HTTP_10 => "http/1.0",
+        Version::HTTP_11 => "http/1.1",
+        Version::HTTP_2 => "http/2",
+        Version::HTTP_3 => "http/3",
+        _ => "<unknown>",
+    };
+
+    let method = match req.method() {
+        &Method::GET => Method::GET.as_str(),
+        &Method::POST => Method::POST.as_str(),
+        &Method::PUT => Method::PUT.as_str(),
+        &Method::DELETE => Method::DELETE.as_str(),
+        &Method::HEAD => Method::HEAD.as_str(),
+        _ => "<other>",
+    };
+
+    let response = _handle(&config, req).await;
+
+    let response_status = match &response {
+        Ok(response) => response.status(),
+        Err(response) => response.status(),
+    };
+
+    // TODO (dano): Also capture latencies. Not possible to do perfectly in hyper
+    //              but we can get close by wrapping body streams, see
+    //              https://github.com/hyperium/hyper/issues/2181.
+
+    statsd_meter!(
+        "server.requests", 1,
+        "http_version" => http_version,
+        "http_method" => method,
+        "http_response_status" => response_status.as_str());
+
+    response
+}
+
+async fn _handle(
+    config: &Arc<Config>,
+    req: Request<Body>,
+) -> Result<Response<Body>, Response<Body>> {
     let secret = req.headers().get(HEADER_SECRET);
     let secret = secret.and_then(|s| s.to_str().ok());
 
