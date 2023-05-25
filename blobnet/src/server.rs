@@ -3,9 +3,14 @@
 use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::future::{self, Future};
+use std::io;
+use std::pin::Pin;
+use std::sync::atomic::AtomicU16;
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
+use std::time::Instant;
 
-use cadence_macros::statsd_meter;
+use cadence_macros::{statsd_count, statsd_meter, statsd_time};
 use hyper::header::HeaderValue;
 use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
@@ -15,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::headers::{HEADER_FILE_LENGTH, HEADER_RANGE, HEADER_SECRET};
 use crate::provider::Provider;
 use crate::utils::{body_stream, get_hash, stream_body};
-use crate::{make_resp, BlobRange, Error};
+use crate::{make_resp, BlobRange, Error, ReadStream};
 
 /// Configuration for the file server.
 pub struct Config {
@@ -100,16 +105,34 @@ async fn handle(config: Arc<Config>, req: Request<Body>) -> Result<Response<Body
         _ => "<other>",
     };
 
-    let response = _handle(&config, req).await;
+    let start = Instant::now();
+    statsd_count!(
+        "server.requests_outstanding", 1,
+        "http_version" => http_version,
+        "http_method" => method);
+    let guard = Arc::new(scopeguard::guard(AtomicU16::new(0), move |status| {
+        let end = Instant::now();
+        let latency = end - start;
+        let status = status.load(SeqCst).to_string();
+        statsd_count!(
+            "server.requests_outstanding", -1,
+            "http_version" => http_version,
+            "http_method" => method);
+        statsd_time!(
+            "server.request_latency_ns", latency.as_nanos() as u64,
+            "http_version" => http_version,
+            "http_method" => method,
+            "http_response_status" => status.as_str());
+    }));
+
+    let response = _handle(&config, req, guard.clone()).await;
 
     let response_status = match &response {
         Ok(response) => response.status(),
         Err(response) => response.status(),
     };
 
-    // TODO (dano): Also capture latencies. Not possible to do perfectly in hyper
-    //              but we can get close by wrapping body streams, see
-    //              https://github.com/hyperium/hyper/issues/2181.
+    guard.store(response_status.as_u16(), SeqCst);
 
     statsd_meter!(
         "server.requests", 1,
@@ -120,10 +143,14 @@ async fn handle(config: Arc<Config>, req: Request<Body>) -> Result<Response<Body
     response
 }
 
-async fn _handle(
+async fn _handle<T>(
     config: &Arc<Config>,
     req: Request<Body>,
-) -> Result<Response<Body>, Response<Body>> {
+    guard: T,
+) -> Result<Response<Body>, Response<Body>>
+where
+    T: Send + Unpin + 'static,
+{
     let secret = req.headers().get(HEADER_SECRET);
     let secret = secret.and_then(|s| s.to_str().ok());
 
@@ -144,7 +171,9 @@ async fn _handle(
             let range = req.headers().get(HEADER_RANGE).and_then(parse_range_header);
             let hash = get_hash(path)?;
             let reader = config.provider.get(hash, range).await?;
-            Ok(Response::new(stream_body(reader.into())))
+            Ok(Response::new(stream_body(Box::pin(
+                InstrumentedStream::new(reader.into(), guard),
+            ))))
         }
         (&Method::PUT, "/") => {
             let body = req.into_body();
@@ -163,4 +192,37 @@ fn parse_range_header(s: &HeaderValue) -> BlobRange {
     let s = s.to_str().ok()?;
     let (start, end) = s.split_once('-')?;
     Some((start.parse().ok()?, end.parse().ok()?))
+}
+
+struct InstrumentedStream<'a, T>
+where
+    T: Unpin,
+{
+    inner: ReadStream<'a>,
+    _guard: T,
+}
+
+impl<'a, T> InstrumentedStream<'a, T>
+where
+    T: Unpin,
+{
+    fn new(inner: ReadStream<'a>, guard: T) -> Self {
+        Self {
+            inner,
+            _guard: guard,
+        }
+    }
+}
+
+impl<T> AsyncRead for InstrumentedStream<'_, T>
+where
+    T: Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_read(cx, buf)
+    }
 }
