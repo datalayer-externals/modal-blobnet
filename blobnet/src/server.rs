@@ -5,12 +5,12 @@ use std::error::Error as StdError;
 use std::future::{self, Future};
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU16;
-use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::{AtomicU16, AtomicU64};
 use std::sync::Arc;
 use std::time::Instant;
 
-use cadence_macros::{statsd_count, statsd_meter, statsd_time};
+use cadence_macros::{statsd_count, statsd_distribution, statsd_gauge};
 use hyper::header::HeaderValue;
 use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
@@ -29,6 +29,15 @@ pub struct Config {
 
     /// Secret that authorizes users to access the service.
     pub secret: String,
+
+    /// Stats aggregation state
+    pub stats: Stats,
+}
+
+/// Stats aggregation state
+#[derive(Default)]
+pub struct Stats {
+    requests_outstanding: AtomicU64,
 }
 
 /// Create a file server listening at the given address.
@@ -87,81 +96,31 @@ where
 
 /// Main service handler for the file server.
 async fn handle(config: Arc<Config>, req: Request<Body>) -> Result<Response<Body>, Response<Body>> {
-    let http_version = match req.version() {
-        Version::HTTP_09 => "http/0.9",
-        Version::HTTP_10 => "http/1.0",
-        Version::HTTP_11 => "http/1.1",
-        Version::HTTP_2 => "http/2",
-        Version::HTTP_3 => "http/3",
-        _ => "<unknown>",
-    };
-
-    let method = match *req.method() {
-        Method::GET => Method::GET.as_str(),
-        Method::POST => Method::POST.as_str(),
-        Method::PUT => Method::PUT.as_str(),
-        Method::DELETE => Method::DELETE.as_str(),
-        Method::HEAD => Method::HEAD.as_str(),
-        _ => "<other>",
-    };
-
-    let start = Instant::now();
-    statsd_count!(
-        "server.requests_outstanding", 1,
-        "http_version" => http_version,
-        "http_method" => method);
-    let guard = Arc::new(scopeguard::guard(AtomicU16::new(0), move |status| {
-        let end = Instant::now();
-        let latency = end - start;
-        let status = status.load(SeqCst).to_string();
-        statsd_count!(
-            "server.requests_outstanding", -1,
-            "http_version" => http_version,
-            "http_method" => method);
-        statsd_time!(
-            "server.request_latency_ns", latency.as_nanos() as u64,
-            "http_version" => http_version,
-            "http_method" => method,
-            "http_response_status" => status.as_str());
-    }));
-
-    let response = _handle(&config, req, guard.clone()).await;
-
+    let request_context = Arc::new(RequestContext::new(config, &req));
+    let response = _handle(&request_context, req).await;
     let response_status = match &response {
         Ok(response) => response.status(),
         Err(response) => response.status(),
     };
-
-    guard.store(response_status.as_u16(), SeqCst);
-
-    statsd_meter!(
-        "server.requests", 1,
-        "http_version" => http_version,
-        "http_method" => method,
-        "http_response_status" => response_status.as_str());
-
+    request_context.response_status(response_status);
     response
 }
 
-async fn _handle<T>(
-    config: &Arc<Config>,
+async fn _handle(
+    ctx: &Arc<RequestContext>,
     req: Request<Body>,
-    guard: T,
-) -> Result<Response<Body>, Response<Body>>
-where
-    T: Send + Unpin + 'static,
-{
+) -> Result<Response<Body>, Response<Body>> {
     let secret = req.headers().get(HEADER_SECRET);
     let secret = secret.and_then(|s| s.to_str().ok());
 
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/") => Ok(make_resp(StatusCode::OK, "blobnet ok")),
-        _ if secret != Some(&config.secret) => {
+        _ if secret != Some(&ctx.config.secret) => {
             Err(make_resp(StatusCode::UNAUTHORIZED, "unauthorized"))
         }
         (&Method::HEAD, path) => {
             let hash = get_hash(path)?;
-            let len = config.provider.head(hash).await?;
+            let len = ctx.config.provider.head(hash).await?;
             Response::builder()
                 .header(HEADER_FILE_LENGTH, len.to_string())
                 .body(Body::empty())
@@ -170,14 +129,14 @@ where
         (&Method::GET, path) => {
             let range = req.headers().get(HEADER_RANGE).and_then(parse_range_header);
             let hash = get_hash(path)?;
-            let reader = config.provider.get(hash, range).await?;
+            let reader = ctx.config.provider.get(hash, range).await?;
             Ok(Response::new(stream_body(Box::pin(
-                InstrumentedStream::new(reader.into(), guard),
+                InstrumentedStream::new(reader.into(), ctx.clone()),
             ))))
         }
         (&Method::PUT, "/") => {
             let body = req.into_body();
-            let hash = config.provider.put(body_stream(body)).await?;
+            let hash = ctx.config.provider.put(body_stream(body)).await?;
             Ok(Response::new(Body::from(hash)))
         }
         _ => Err(make_resp(StatusCode::NOT_FOUND, "invalid request path")),
@@ -194,30 +153,86 @@ fn parse_range_header(s: &HeaderValue) -> BlobRange {
     Some((start.parse().ok()?, end.parse().ok()?))
 }
 
-struct InstrumentedStream<'a, T>
-where
-    T: Unpin,
-{
-    inner: ReadStream<'a>,
-    _guard: T,
+struct RequestContext {
+    http_version: &'static str,
+    http_method: &'static str,
+    start: Instant,
+    status: AtomicU16,
+    config: Arc<Config>,
 }
 
-impl<'a, T> InstrumentedStream<'a, T>
-where
-    T: Unpin,
-{
-    fn new(inner: ReadStream<'a>, guard: T) -> Self {
-        Self {
-            inner,
-            _guard: guard,
+impl RequestContext {
+    fn new(config: Arc<Config>, req: &Request<Body>) -> RequestContext {
+        let http_version = match req.version() {
+            Version::HTTP_09 => "http/0.9",
+            Version::HTTP_10 => "http/1.0",
+            Version::HTTP_11 => "http/1.1",
+            Version::HTTP_2 => "http/2",
+            Version::HTTP_3 => "http/3",
+            _ => "<unknown>",
+        };
+
+        let http_method = match *req.method() {
+            Method::GET => Method::GET.as_str(),
+            Method::POST => Method::POST.as_str(),
+            Method::PUT => Method::PUT.as_str(),
+            Method::DELETE => Method::DELETE.as_str(),
+            Method::HEAD => Method::HEAD.as_str(),
+            _ => "<other>",
+        };
+
+        let requests_outstanding = config.stats.requests_outstanding.fetch_add(1, Relaxed);
+        statsd_gauge!(
+            "server.requests_outstanding", requests_outstanding,
+            "http_version" => http_version,
+            "http_method" => http_method);
+
+        RequestContext {
+            http_version,
+            http_method,
+            config,
+            start: Instant::now(),
+            status: Default::default(),
         }
+    }
+
+    fn response_status(&self, status: StatusCode) {
+        self.status.store(status.as_u16(), SeqCst);
+
+        statsd_count!(
+            "server.requests", 1,
+            "http_version" => self.http_version,
+            "http_method" => self.http_method,
+            "http_response_status" => status.as_str());
     }
 }
 
-impl<T> AsyncRead for InstrumentedStream<'_, T>
-where
-    T: Unpin,
-{
+impl Drop for RequestContext {
+    fn drop(&mut self) {
+        let end = Instant::now();
+        let latency = end - self.start;
+        let status = self.status.load(SeqCst).to_string();
+        self.config.stats.requests_outstanding.fetch_sub(1, Relaxed);
+        statsd_distribution!(
+            "server.request_latency_ns", latency.as_nanos() as u64,
+            "http_version" => self.http_version,
+            "http_method" => self.http_method,
+            "http_response_status" => status.as_str());
+    }
+}
+
+struct InstrumentedStream<'a> {
+    inner: ReadStream<'a>,
+    _ctx: Arc<RequestContext>,
+}
+
+impl<'a> InstrumentedStream<'a> {
+    fn new(inner: ReadStream<'a>, ctx: Arc<RequestContext>) -> Self {
+        Self { inner, _ctx: ctx }
+    }
+}
+
+impl AsyncRead for InstrumentedStream<'_> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

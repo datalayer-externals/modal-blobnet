@@ -34,6 +34,7 @@ async fn spawn_temp_server() -> Result<Arc<TrackingProvider>> {
         let config = Config {
             provider: Box::new(provider),
             secret: "secret".into(),
+            stats: Default::default(),
         };
         listen(config, incoming).await.unwrap();
     });

@@ -105,6 +105,7 @@ async fn main() -> Result<()> {
     let config = Config {
         provider,
         secret: args.secret,
+        stats: Default::default(),
     };
 
     if let Some(unix_socket) = args.unix_socket {
