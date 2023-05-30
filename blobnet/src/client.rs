@@ -100,8 +100,14 @@ impl<C: Connect + Clone + Send + Sync + 'static> FileClient<C> {
     /// Send an HTTP request, retrying on server errors.
     ///
     /// This retry operation fixes rare transient disconnects of a few
-    /// milliseconds when the blobnet server is terminated, due to a restart. It
-    /// also retries if the body stream is canceled or closed abnormally.
+    /// milliseconds when the blobnet server is terminated, due to a restart.
+    ///
+    /// It also retries if the request body stream is canceled or closed
+    /// abnormally.
+    ///
+    /// However, it does not retry if the response body stream is canceled or
+    /// closed abnormally as that error surfaces when the body stream is
+    /// consumed by the `FileClient` user.
     async fn request_with_retry<Fut>(
         &self,
         make_req: impl Fn() -> Fut,
