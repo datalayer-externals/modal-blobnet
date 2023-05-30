@@ -109,9 +109,10 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::io;
+use std::fmt::Formatter;
 use std::io::Cursor;
 use std::pin::Pin;
+use std::{fmt, io};
 
 use anyhow::anyhow;
 use bytes::Bytes;
@@ -166,6 +167,15 @@ impl<'a> BlobRead<'a> {
     /// Create a `BlobRead` from a stream of bytes
     pub fn from_stream<T: AsyncRead + Send + 'a>(value: T) -> BlobRead<'a> {
         BlobRead::Stream(Box::pin(value))
+    }
+}
+
+impl<'a> fmt::Debug for BlobRead<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            BlobRead::Bytes(bytes) => fmt::Debug::fmt(bytes, f),
+            BlobRead::Stream(_) => fmt::Debug::fmt("stream", f),
+        }
     }
 }
 
