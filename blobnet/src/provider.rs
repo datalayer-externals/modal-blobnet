@@ -13,10 +13,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use auto_impl::auto_impl;
-use aws_sdk_s3::{
-    error::{GetObjectErrorKind, HeadObjectErrorKind},
-    types::SdkError,
-};
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use cadence_macros::*;
 use fs2::FsStats;
 use hashlink::LinkedHashMap;
@@ -158,8 +157,8 @@ impl Provider for S3 {
 
         match result {
             Ok(resp) => Ok(resp.content_length() as u64),
-            Err(SdkError::ServiceError { err, .. })
-                if matches!(err.kind, HeadObjectErrorKind::NotFound(_)) =>
+            Err(SdkError::ServiceError(err))
+                if matches!(err.err(), HeadObjectError::NotFound(_)) =>
             {
                 Err(Error::NotFound)
             }
@@ -189,13 +188,13 @@ impl Provider for S3 {
 
         match result {
             Ok(resp) => Ok(BlobRead::from_stream(resp.body.into_async_read())),
-            Err(SdkError::ServiceError { err, .. })
-                if matches!(err.kind, GetObjectErrorKind::NoSuchKey(_)) =>
+            Err(SdkError::ServiceError(err))
+                if matches!(err.err(), GetObjectError::NoSuchKey(_)) =>
             {
                 Err(Error::NotFound)
             }
-            // InvalidRange isn't supported on the `GetObjectErrorKind` enum.
-            Err(SdkError::ServiceError { err, .. }) if err.code() == Some("InvalidRange") => {
+            // InvalidRange isn't supported on the `GetObjectError` enum.
+            Err(SdkError::ServiceError(err)) if err.err().code() == Some("InvalidRange") => {
                 // Edge case: S3 throws errors if the start of the range is at or after the
                 // end of the file, but we want to support this for consistency.
                 Ok(empty_read())
