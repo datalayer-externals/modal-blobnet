@@ -120,6 +120,9 @@ use hyper::{Body, Response, StatusCode};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+#[macro_use]
+extern crate derive_builder;
+
 #[cfg(doc)]
 use crate::provider::{Cached, Provider};
 

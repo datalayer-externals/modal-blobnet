@@ -1,9 +1,11 @@
 //! Configurable, async storage providers for blob access.
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Cursor, Seek, Write};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -388,6 +390,14 @@ struct PageCache {
 }
 
 impl PageCache {
+    fn new_with_capacity(total_capacity: u64) -> PageCache {
+        PageCache {
+            mapping: LinkedHashMap::new(),
+            total_cost: 0,
+            total_capacity,
+        }
+    }
+
     /// Insert an entry into the page cache, with LRU eviction.
     fn insert(&mut self, hash: String, n: u64, bytes: Bytes) {
         use hashlink::linked_hash_map::Entry;
@@ -421,6 +431,17 @@ impl PageCache {
         }
     }
 
+    /// Remove an entry from the page cache
+    fn remove(&mut self, hash: String, n: u64) -> Option<Bytes> {
+        let bytes = self.mapping.remove(&(hash, n));
+        if let Some(bytes) = bytes {
+            self.total_cost -= bytes.len() as u64 + PAGE_CACHE_ENTRY_COST;
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+
     /// Get an entry from the page cache, without LRU eviction.
     fn peek(&mut self, hash: String, n: u64) -> Option<Bytes> {
         self.mapping.get(&(hash, n)).map(Bytes::clone)
@@ -440,15 +461,28 @@ impl Default for PageCache {
 type RequestKey = (String, u64);
 type PendingRequest = broadcast::Receiver<Result<Bytes, Error>>;
 
+struct BlobDiskCacheWriteRequest {
+    hash: String,
+    n: u64,
+    len: u64,
+}
+
+enum DiskCacheTask {
+    WriteBlob(BlobDiskCacheWriteRequest),
+    Shutdown,
+}
+
 struct CachedState<P> {
     inner: P,
     page_cache: Mutex<PageCache>,
     pending_requests: Mutex<HashMap<RequestKey, PendingRequest>>,
     dir: PathBuf,
     pagesize: u64,
-    diskcache_semaphore: tokio::sync::Semaphore,
     diskcache_pending_write_pages: AtomicU64,
     diskcache_pending_write_bytes: AtomicU64,
+    diskcache_pending_write_cache: Mutex<PageCache>,
+    diskcache_write_threads: usize,
+    diskcache_write_queue_tx: flume::Sender<DiskCacheTask>,
 }
 
 /// Stats of `CachedState`
@@ -471,26 +505,106 @@ pub struct CacheStats {
     pub disk_used_bytes: u64,
 }
 
+/// Configuration for a `Cached` provider.
+#[derive(Default, Builder, Debug)]
+#[builder(pattern = "owned")]
+pub struct CacheConfig<P: Provider + 'static> {
+    /// The provider to wrap and delegate requests to on cache-miss.
+    pub inner: P,
+
+    /// The directory of the disk cache
+    #[builder(setter(into))]
+    pub dir: PathBuf,
+
+    /// The size of pages (aka chunks) in the cache.
+    #[builder(default = "2 * 1024 * 1024")]
+    pub pagesize: u64,
+
+    /// The concurrency level at which to write pages to disk cache.
+    #[builder(default = "1")]
+    pub diskcache_write_concurrency: usize,
+
+    /// The maximum amount of data to keep cached in-memory while pending
+    /// writing to disk cache.
+    #[builder(default = "0")]
+    pub diskcache_pending_write_cache_limit_bytes: u64,
+
+    /// Prefetch the N-ahead chunk. Setting to 0 implies no prefetching.
+    #[builder(default = "0")]
+    pub prefetch_depth: u32,
+}
+
+impl<P: Provider + 'static> CacheConfig<P> {
+    /// Consume this configuration and create a `Cached` provider.
+    pub fn into_provider(self) -> Cached<P> {
+        Cached::from(self)
+    }
+}
+
+impl<P: Provider + 'static> From<CacheConfig<P>> for Cached<P> {
+    /// Create a new cache wrapper for a provider with the given config.
+    fn from(config: CacheConfig<P>) -> Self {
+        assert!(config.pagesize >= 4096, "pagesize must be at least 4096");
+        let (diskcache_write_queue_tx, diskcache_write_queue_rx) = flume::unbounded();
+        let state = Arc::new(CachedState {
+            inner: config.inner,
+            page_cache: Default::default(),
+            pending_requests: Default::default(),
+            dir: config.dir, // File system cache
+            pagesize: config.pagesize,
+            diskcache_pending_write_pages: Default::default(),
+            diskcache_pending_write_bytes: Default::default(),
+            diskcache_pending_write_cache: Mutex::new(PageCache::new_with_capacity(
+                config.diskcache_pending_write_cache_limit_bytes,
+            )),
+            diskcache_write_threads: config.diskcache_write_concurrency,
+            diskcache_write_queue_tx,
+        });
+        // Note: We spawn dedicated long-lived threads to perform disk cache writes.
+        // Previously we spawned blocking tasks per chunk to flush it to disk,
+        // but this seemed to suffer from starvation when blobnet was also
+        // serving requests. The pending disk cache writes would queue up but
+        // forward progress writing them to disk was very slow. The root cause is still
+        // unclear but dedicated threads seem to avoid this problem.
+        for _ in 0..config.diskcache_write_concurrency {
+            let state = Arc::clone(&state);
+            let rx = diskcache_write_queue_rx.clone();
+            std::thread::spawn(move || {
+                state._disk_cache_populator(rx);
+            });
+        }
+        Self {
+            state,
+            prefetch_depth: config.prefetch_depth,
+        }
+    }
+}
+
+impl<P> Drop for Cached<P> {
+    fn drop(&mut self) {
+        // Tell each writer thread to shut down
+        for _ in 0..self.state.diskcache_write_threads {
+            self.state
+                .diskcache_write_queue_tx
+                .send(DiskCacheTask::Shutdown)
+                .ok();
+        }
+    }
+}
+
 impl<P: Provider + 'static> Cached<P> {
     /// Create a new cache wrapper for the given provider.
     ///
     /// Set the page size in bytes for cached chunks, as well as the directory
     /// where fragments should be stored.
     pub fn new(inner: P, dir: impl AsRef<Path>, pagesize: u64) -> Self {
-        assert!(pagesize >= 4096, "pagesize must be at least 4096");
-        Self {
-            state: Arc::new(CachedState {
-                inner,
-                page_cache: Default::default(),
-                pending_requests: Default::default(),
-                dir: dir.as_ref().to_owned(), // File system cache
-                pagesize,
-                diskcache_semaphore: tokio::sync::Semaphore::new(1),
-                diskcache_pending_write_pages: Default::default(),
-                diskcache_pending_write_bytes: Default::default(),
-            }),
-            prefetch_depth: 0,
-        }
+        CacheConfigBuilder::default()
+            .inner(inner)
+            .dir(dir.as_ref())
+            .pagesize(pagesize)
+            .build()
+            .unwrap()
+            .into_provider()
     }
 
     /// Prefetch the N-ahead chunk. Setting to 0 implies no prefetching.
@@ -546,6 +660,14 @@ impl<P: Provider + 'static> CachedState<P> {
         Out: Future<Output = Result<Bytes, Error>> + Send,
     {
         if let Some(bytes) = self.page_cache.lock().get(hash.clone(), n) {
+            return Ok(bytes);
+        }
+
+        if let Some(bytes) = self
+            .diskcache_pending_write_cache
+            .lock()
+            .get(hash.clone(), n)
+        {
             return Ok(bytes);
         }
 
@@ -643,7 +765,7 @@ impl<P: Provider + 'static> CachedState<P> {
                 .lock()
                 .insert(hash.clone(), n, bytes.clone());
             if !hit_diskcache {
-                self.populate_disk_cache(hash, n, func, bytes.len() as u64);
+                self.populate_disk_cache(hash, n, bytes.clone()).await;
             }
         };
 
@@ -651,38 +773,54 @@ impl<P: Provider + 'static> CachedState<P> {
     }
 
     /// Asynchronously populate the disk cache with the specified hash chunk
-    fn populate_disk_cache<F, Out>(self: &Arc<Self>, hash: String, n: u64, func: F, bytes_len: u64)
-    where
-        F: (Fn(Arc<Self>, String, u64) -> Out) + Send + 'static,
-        Out: Future<Output = Result<Bytes, Error>> + Send,
-    {
-        self.diskcache_pending_write_pages.fetch_add(1, Relaxed);
-        self.diskcache_pending_write_bytes
-            .fetch_add(bytes_len, Relaxed);
+    async fn populate_disk_cache(self: &Arc<Self>, hash: String, n: u64, bytes: Bytes) {
+        let bytes_len = bytes.len() as u64;
 
-        let state = scopeguard::guard(self.clone(), move |state| {
-            state.diskcache_pending_write_pages.fetch_sub(1, Relaxed);
-            state
-                .diskcache_pending_write_bytes
-                .fetch_sub(bytes_len, Relaxed);
+        // TODO (dano): have disk cache populator re-fetch chunks that are evicted
+        //              before they are written to disk - needs explicit requests
+        //              instead of closures: https://github.com/modal-labs/blobnet/pull/62
+
+        self.diskcache_pending_write_cache
+            .lock()
+            .insert(hash.clone(), n, bytes);
+
+        let task = DiskCacheTask::WriteBlob(BlobDiskCacheWriteRequest {
+            hash,
+            n,
+            len: bytes_len,
         });
 
-        tokio::spawn(async move {
-            // Throttle disk writes to not impact user read request latency
-            if let Ok(_permit) = state.diskcache_semaphore.acquire().await {
-                state._populate_disk_cache(hash, n, func).await;
-            }
-        });
+        if let Err(e) = self.diskcache_write_queue_tx.send(task) {
+            eprintln!("Failed to enqueue disk cache write: {e}");
+        } else {
+            self.diskcache_pending_write_pages.fetch_add(1, Relaxed);
+            self.diskcache_pending_write_bytes
+                .fetch_add(bytes_len, Relaxed);
+        }
     }
 
-    async fn _populate_disk_cache<F, Out>(self: &Arc<Self>, hash: String, n: u64, func: F)
-    where
-        F: (Fn(Arc<Self>, String, u64) -> Out) + Send + 'static,
-        Out: Future<Output = Result<Bytes, Error>> + Send,
-    {
-        let path = match self.page_disk_path(&hash, n) {
+    fn _disk_cache_populator(self: &Arc<Self>, rx: flume::Receiver<DiskCacheTask>) {
+        loop {
+            match rx.recv() {
+                Ok(DiskCacheTask::WriteBlob(r)) => self._populate_disk_cache(r.hash, r.n, r.len),
+                Ok(DiskCacheTask::Shutdown) => return,
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn _populate_disk_cache(self: &Arc<Self>, hash: String, n: u64, bytes_len: u64) {
+        let guard = scopeguard::guard((hash, n), |(hash, n)| {
+            self.diskcache_pending_write_pages.fetch_sub(1, Relaxed);
+            self.diskcache_pending_write_bytes
+                .fetch_sub(bytes_len, Relaxed);
+            self.diskcache_pending_write_cache.lock().remove(hash, n);
+        });
+        let (hash, n) = guard.deref();
+
+        let path = match self.page_disk_path(hash, *n) {
             // Bail if the page is already on disk
-            Ok(path) if fs::metadata(&path).await.is_ok() => return,
+            Ok(path) if std::fs::metadata(&path).is_ok() => return,
             Ok(path) => path,
             Err(err) => {
                 eprintln!("error computing page disk path: {err:?}");
@@ -690,32 +828,25 @@ impl<P: Provider + 'static> CachedState<P> {
             }
         };
 
-        // Get the page from page cache if present
-        let bytes = self.page_cache.lock().peek(hash.clone(), n);
+        // Get the page from the write queue if present
+        let bytes = self
+            .diskcache_pending_write_cache
+            .lock()
+            .peek(hash.clone(), *n);
         let bytes = if let Some(bytes) = bytes {
             Some(bytes)
         } else {
-            // Fall back to re-fetching the page
-            let f = func(self.clone(), hash, n);
-            f.await
-                .map_err(|err| {
-                    eprintln!("error getting {path:?} cache contents: {err:?}");
-                    err
-                })
-                .ok()
+            // Get the page from page cache if present
+            self.page_cache.lock().peek(hash.clone(), *n)
         };
 
         // Write the page to disk
         if let Some(bytes) = bytes {
-            task::spawn_blocking(move || {
-                let len = bytes.len() as u64;
-                let read_buf = Cursor::new(bytes);
-                if let Err(err) = atomic_copy(read_buf, &path, len) {
-                    eprintln!("error writing {path:?} cache file: {err:?}");
-                }
-            })
-            .await
-            .ok();
+            let len = bytes.len() as u64;
+            let read_buf = Cursor::new(bytes);
+            if let Err(err) = atomic_copy(read_buf, &path, len) {
+                eprintln!("error writing {path:?} cache file: {err:?}");
+            }
         }
     }
 
@@ -980,6 +1111,7 @@ mod tests {
     use hyper::body::Bytes;
 
     use super::{Memory, PageCache, Provider};
+    use crate::provider::PAGE_CACHE_ENTRY_COST;
     use crate::Error;
 
     #[test]
@@ -1003,6 +1135,35 @@ mod tests {
         }
         assert_eq!(cache.get(String::new(), 0), Some(page));
         assert!(cache.mapping.len() == 1);
+    }
+
+    #[test]
+    fn page_cache_removes() {
+        let mut cache = PageCache::default();
+        let page1 = Bytes::from(vec![42; 256]);
+        let page2 = Bytes::from(vec![42; 256]);
+        let hash = "foo".to_string();
+
+        cache.insert(hash.clone(), 0, page1.clone());
+        cache.insert(hash.clone(), 1, page2.clone());
+        assert_eq!(cache.mapping.len(), 2);
+        assert_eq!(cache.total_cost, 2 * (256 + PAGE_CACHE_ENTRY_COST));
+
+        assert_eq!(cache.remove(hash.clone(), 0), Some(page1));
+        assert_eq!(cache.mapping.len(), 1);
+        assert_eq!(cache.total_cost, 1 * (256 + PAGE_CACHE_ENTRY_COST));
+
+        assert_eq!(cache.remove(hash.clone(), 0), None);
+        assert_eq!(cache.mapping.len(), 1);
+        assert_eq!(cache.total_cost, 1 * (256 + PAGE_CACHE_ENTRY_COST));
+
+        assert_eq!(cache.remove(hash.clone(), 1), Some(page2));
+        assert_eq!(cache.mapping.len(), 0);
+        assert_eq!(cache.total_cost, 0);
+
+        assert_eq!(cache.remove(hash.clone(), 1), None);
+        assert_eq!(cache.mapping.len(), 0);
+        assert_eq!(cache.total_cost, 0);
     }
 
     #[tokio::test]

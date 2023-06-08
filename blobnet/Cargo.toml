@@ -14,6 +14,7 @@ build = "build.rs"
 
 [dependencies]
 anyhow = { version = "1.0.56", features = ["backtrace"] }
+async-channel = "1.8.0"
 async-trait = "0.1.58"
 auto_impl = "1.0.1"
 aws-config = "0.55.3"
@@ -24,8 +25,9 @@ bytes = "1"
 cadence = "0.29.1"
 cadence-macros = "0.29.1"
 clap = { version = "4.0.18", features = ["derive", "env"] }
-async-channel = "1.8.0"
+derive_builder = "0.12.0"
 fastrand = "1.8.0"
+flume = "0.10.14"
 fs2 = "0.4.3"
 hashlink = "0.8.1"
 hex = "0.4.3"

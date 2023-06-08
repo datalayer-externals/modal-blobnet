@@ -53,6 +53,14 @@ pub struct Cli {
     /// Disable StatsD metrics emission. By default emitted to 127.0.0.1:8125.
     #[clap(long)]
     pub no_statsd: bool,
+
+    /// Disk cache write concurrency.
+    #[clap(long, env = "BLOBNET_DISKCACHE_WRITE_CONCURRENCY", default_value_t = 4)]
+    pub diskcache_write_concurrency: usize,
+
+    /// Disk cache write cache size limit in bytes.
+    #[clap(long, env = "BLOBNET_DISKCACHE_WRITE_CACHE_LIMIT_BYTES", default_value_t = 64 * 1024 * 1024)]
+    pub diskcache_pending_write_cache_limit_bytes: u64,
 }
 
 #[global_allocator]
@@ -95,7 +103,15 @@ async fn main() -> Result<()> {
 
     if let Some(cache) = args.cache {
         // Server cache has 2 MiB page size.
-        let caching = provider::Cached::new(provider, cache, 1 << 21);
+        let caching = provider::CacheConfigBuilder::default()
+            .inner(provider)
+            .dir(cache)
+            .diskcache_write_concurrency(args.diskcache_write_concurrency)
+            .diskcache_pending_write_cache_limit_bytes(
+                args.diskcache_pending_write_cache_limit_bytes,
+            )
+            .build()?
+            .into_provider();
         tokio::spawn(caching.cleaner());
         tokio::spawn(caching.stats_logger());
         tokio::spawn(caching.stats_emitter());
