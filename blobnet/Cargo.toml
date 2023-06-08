@@ -55,6 +55,7 @@ rand = { version = "0.8.5", features = ["std", "std_rng"] }
 
 [build-dependencies]
 shadow-rs = "0.21.0"
+vergen = { version = "8.0.0", features = ["build", "git", "gitcl"] }
 
 [[bench]]
 name = "read_benchmark"
