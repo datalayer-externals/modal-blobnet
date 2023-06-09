@@ -5,7 +5,6 @@
 
 #![allow(unsafe_code)]
 
-use std::fs::File;
 use std::future::Future;
 use std::io;
 use std::mem::MaybeUninit;
@@ -14,6 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 
+use tokio::fs::File;
 use tokio::io::AsyncRead;
 use tokio::task;
 
@@ -161,20 +161,19 @@ impl AsyncRead for FileReader {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, sync::Arc};
-
     use anyhow::Result;
-    use tokio::task;
+    use tokio::fs::File;
+    use tokio::io::AsyncWriteExt;
 
     use super::file_reader;
     use crate::read_to_vec;
 
     #[tokio::test]
     async fn test_file_reader() -> Result<()> {
-        let file = Arc::new(tempfile::tempfile()?);
+        let mut file = File::from_std(tempfile::tempfile()?);
 
-        let file2 = Arc::clone(&file);
-        task::spawn_blocking(move || (&mut &*file2).write_all(b"hello world")).await??;
+        file.write_all(b"hello world").await?;
+        file.sync_all().await?;
 
         let reader = file_reader(file, None);
         assert_eq!(read_to_vec(reader).await?, b"hello world");

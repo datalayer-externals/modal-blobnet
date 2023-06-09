@@ -2,9 +2,8 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::fs::File;
 use std::future::Future;
-use std::io::{self, Cursor, Seek, Write};
+use std::io::{self, Cursor};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -25,6 +24,8 @@ use hyper::{body::Bytes, client::connect::Connect};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tempfile::tempfile;
+use tokio::fs::File;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::broadcast::Sender;
 use tokio::{fs, io::AsyncReadExt, sync::broadcast, task, time};
 use tokio_stream::StreamExt;
@@ -255,7 +256,7 @@ impl Provider for LocalDir {
         check_range(range)?;
         let key = hash_path(hash)?;
         let path = self.dir.join(key);
-        let file = match File::open(path) {
+        let file = match File::open(path).await {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(Error::NotFound),
             Err(err) => return Err(err.into()),
@@ -269,6 +270,7 @@ impl Provider for LocalDir {
         let hash = format!("{:x}", digest.finalize());
         let key = hash_path(&hash)?;
         let path = self.dir.join(key);
+        let file = file.into_std().await;
         task::spawn_blocking(move || atomic_copy(file, path, len))
             .await
             .map_err(anyhow::Error::from)??;
@@ -313,7 +315,7 @@ async fn make_data_tempfile(
     mut data: ReadStream<'_>,
     mut digest: Option<&mut Sha256>,
 ) -> anyhow::Result<(File, u64)> {
-    let mut file = task::spawn_blocking(tempfile).await??;
+    let mut file = File::from_std(task::spawn_blocking(tempfile).await??);
     let mut len = 0;
     loop {
         let mut buf = Vec::with_capacity(1 << 21);
@@ -325,10 +327,9 @@ async fn make_data_tempfile(
         if let Some(ref mut d) = digest {
             d.update(&buf);
         }
-        // Hack needed for ownership issues with spawn_blocking being 'static.
-        file = task::spawn_blocking(move || file.write_all(&buf).map(|_| file)).await??;
+        file.write_all(&buf).await?;
     }
-    file = task::spawn_blocking(move || file.rewind().map(|_| file)).await??;
+    file.rewind().await?;
     Ok((file, len as u64))
 }
 
