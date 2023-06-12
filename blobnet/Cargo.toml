@@ -32,10 +32,12 @@ fs2 = "0.4.3"
 hashlink = "0.8.1"
 hex = "0.4.3"
 hyper = { version = "0.14.18", features = ["full"] }
+hyper-rustls = "0.24.0"
 hyperlocal = "0.8.0"
 libc = "0.2.139"
 named-retry = { path = "../named-retry", version = "0.2.0" }
 parking_lot = "0.12.1"
+rustls = "0.21.1"
 scopeguard = "1.1.0"
 sha2 = "0.10.2"
 shadow-rs = "0.21.0"

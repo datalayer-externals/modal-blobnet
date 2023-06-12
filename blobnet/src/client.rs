@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{anyhow, ensure, Context};
 use hyper::client::{connect::Connect, HttpConnector};
 use hyper::{Body, Client, HeaderMap, Request, StatusCode};
+use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use named_retry::Retry;
 
 use crate::headers::{HEADER_FILE_LENGTH, HEADER_RANGE, HEADER_SECRET};
@@ -83,6 +84,45 @@ impl FileClient<HttpConnector> {
     pub fn new_http_with_pool(origin: &str, secret: &str, num_connections: u32) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
+        Self::new(connector, origin, secret, num_connections)
+    }
+}
+
+impl FileClient<HttpsConnector<HttpConnector>> {
+    /// Helper method that creates a client with an ordinary HTTPs connector.
+    pub fn new_https(origin: &str, secret: &str) -> Self {
+        let mut http_connector = HttpConnector::new();
+        http_connector.enforce_http(false);
+        http_connector.set_nodelay(true);
+        let tls = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_native_roots()
+            .with_no_client_auth();
+
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_only()
+            .enable_http1()
+            .build();
+        Self::new(connector, origin, secret, 1)
+    }
+
+    /// Helper method that creates an HTTPs client supporting multiple HTTP/2
+    /// connections to the same HOST:PORT address.
+    pub fn new_https_with_pool(origin: &str, secret: &str, num_connections: u32) -> Self {
+        let mut http_connector = HttpConnector::new();
+        http_connector.enforce_http(false);
+        http_connector.set_nodelay(true);
+        let tls = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_native_roots()
+            .with_no_client_auth();
+
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_only()
+            .enable_http1()
+            .build();
         Self::new(connector, origin, secret, num_connections)
     }
 }

@@ -2,6 +2,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use blobnet::client::FileClient;
 use blobnet::provider::{self, Provider};
 use blobnet::server::{self, Config};
 use blobnet::statsd;
@@ -67,7 +68,7 @@ pub struct Cli {
 static GLOBAL: Jemalloc = Jemalloc;
 
 /// Attempt to parse a provider from CLI argument.
-async fn parse_provider(source: &str) -> Result<Box<dyn Provider>> {
+async fn parse_provider(source: &str, secret: &str) -> Result<Box<dyn Provider>> {
     let (kind, arg) = source
         .split_once(':')
         .with_context(|| format!("source {source:?} has no ':' character"))?;
@@ -79,6 +80,17 @@ async fn parse_provider(source: &str) -> Result<Box<dyn Provider>> {
             Box::new(provider::S3::new(s3, arg).await?)
         }
         "localdir" => Box::new(provider::LocalDir::new(arg)),
+        "remote" => {
+            // TODO: Limitation is that remote provider must use the same secret as this
+            // client server.
+            if arg.starts_with("https") {
+                Box::new(provider::Remote::new(FileClient::new_https(arg, secret)))
+            } else if arg.starts_with("http") {
+                Box::new(provider::Remote::new(FileClient::new_http(arg, secret)))
+            } else {
+                bail!("unsupported remote protocol in address: {arg:?}")
+            }
+        }
         _ => bail!("unknown provider type {kind:?}"),
     })
 }
@@ -94,10 +106,10 @@ async fn main() -> Result<()> {
 
     statsd::try_init(!args.no_statsd)?;
 
-    let mut provider = parse_provider(&args.source).await?;
+    let mut provider = parse_provider(&args.source, &args.secret).await?;
 
     if let Some(fallback) = args.fallback {
-        let fallback = parse_provider(&fallback).await?;
+        let fallback = parse_provider(&fallback, &args.secret).await?;
         provider = Box::new((provider, fallback));
     }
 
