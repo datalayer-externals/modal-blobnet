@@ -15,7 +15,7 @@ use bytes::Bytes;
 use tokio::io::AsyncRead;
 use tokio::sync::oneshot;
 
-use crate::{provider::Provider, read_to_vec, BlobRange, BlobRead, Error, ReadStream};
+use crate::{proto, provider::Provider, read_to_vec, BlobRange, BlobRead, Error, ReadStream};
 
 /// Tracks network out bytes served by `get` requests.
 pub struct Tracking<P> {
@@ -54,6 +54,10 @@ impl<P: Provider> Provider for Tracking<P> {
 
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error> {
         self.inner.put(data).await
+    }
+
+    async fn preload(&self, preload: proto::Preload) -> Result<(), Error> {
+        self.inner.preload(preload).await
     }
 }
 
@@ -110,6 +114,13 @@ impl<P: Provider> Provider for Delayed<P> {
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error> {
         wait(0.5 * self.base_delay).await;
         let result = self.inner.put(self.wrap_throttle(data)).await;
+        wait(0.5 * self.base_delay).await;
+        result
+    }
+
+    async fn preload(&self, preload: proto::Preload) -> Result<(), Error> {
+        wait(0.5 * self.base_delay).await;
+        let result = self.inner.preload(preload).await;
         wait(0.5 * self.base_delay).await;
         result
     }
@@ -211,14 +222,18 @@ impl AsyncRead for TrackingStream<'_> {
 pub type HeadRequest = String;
 pub type GetRequest = (String, BlobRange);
 pub type PutRequest = Bytes;
+pub type PreloadRequest = proto::Preload;
 pub type PendingHeadResponse = oneshot::Sender<Result<u64, Error>>;
 pub type PendingGetResponse = oneshot::Sender<Result<Bytes, Error>>;
 pub type PendingPutResponse = oneshot::Sender<Result<String, Error>>;
+pub type PendingPreloadResponse = oneshot::Sender<Result<(), Error>>;
 
+#[derive(Debug)]
 pub enum Request {
     Head(HeadRequest, PendingHeadResponse),
     Get(GetRequest, PendingGetResponse),
     Put(PutRequest, PendingPutResponse),
+    Preload(PreloadRequest, PendingPreloadResponse),
 }
 
 pub struct MockProvider {
@@ -262,6 +277,15 @@ impl Provider for MockProvider {
         let (tx, rx) = oneshot::channel();
         self.requests_tx
             .send(Request::Put(Bytes::from(read_to_vec(data).await?), tx))
+            .await
+            .map_err(anyhow::Error::from)?;
+        rx.await.map_err(anyhow::Error::from)?
+    }
+
+    async fn preload(&self, preload: proto::Preload) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.requests_tx
+            .send(Request::Preload(preload, tx))
             .await
             .map_err(anyhow::Error::from)?;
         rx.await.map_err(anyhow::Error::from)?

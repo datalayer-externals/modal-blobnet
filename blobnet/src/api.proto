@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package blobnet.api;
+
+message Preload {
+  message Blob {
+    string hash = 1;
+    uint64 size = 2;
+  }
+  repeated Blob blobs = 1;
+}

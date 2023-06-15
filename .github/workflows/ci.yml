@@ -23,6 +23,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+
       - run: cargo build --all-features
 
       - run: cargo test

@@ -6,12 +6,13 @@ use std::future::Future;
 use std::io::{self, Cursor};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
+use async_channel::TrySendError::{Closed, Full};
 use async_trait::async_trait;
 use auto_impl::auto_impl;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -34,7 +35,7 @@ use tokio_util::io::StreamReader;
 use crate::client::FileClient;
 use crate::fast_aio::file_reader;
 use crate::utils::{atomic_copy, hash_path, stream_body};
-use crate::{read_to_bytes_with_fit, BlobRange, BlobRead, Error, ReadStream};
+use crate::{proto, read_to_bytes_with_fit, BlobRange, BlobRead, Error, ReadStream};
 
 /// Specifies a storage backend for the blobnet service.
 ///
@@ -76,6 +77,9 @@ pub trait Provider: Send + Sync {
     /// async fn put(&self, data: ReadStream<'_>) -> Result<String, Error>;
     /// ```
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error>;
+
+    /// Asynchronously preload a list of blobs into local caches.
+    async fn preload(&self, preload: proto::Preload) -> Result<(), Error>;
 }
 
 /// A provider that stores blobs in memory, only used for testing.
@@ -121,6 +125,10 @@ impl Provider for Memory {
         let hash = format!("{:x}", Sha256::new().chain_update(&buf).finalize());
         self.data.write().insert(hash.clone(), Bytes::from(buf));
         Ok(hash)
+    }
+
+    async fn preload(&self, _preload: proto::Preload) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -222,6 +230,10 @@ impl Provider for S3 {
             .map_err(anyhow::Error::from)?;
         Ok(hash)
     }
+
+    async fn preload(&self, _preload: proto::Preload) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// A provider that stores blobs in a local directory.
@@ -276,6 +288,12 @@ impl Provider for LocalDir {
             .map_err(anyhow::Error::from)??;
         Ok(hash)
     }
+
+    async fn preload(&self, _preload: proto::Preload) -> Result<(), Error> {
+        // Note(dano): We do not read blobs into page cache here as we do not know for
+        //             certain that they will actually be read and page cache is scarce.
+        Ok(())
+    }
 }
 
 /// A provider that routes requests to a remote blobnet server.
@@ -306,6 +324,10 @@ impl<C: Connect + Clone + Send + Sync + 'static> Provider for Remote<C> {
         self.client
             .put(|| async { Ok(stream_body(file_reader(Arc::clone(&file), None))) })
             .await
+    }
+
+    async fn preload(&self, preload: proto::Preload) -> Result<(), Error> {
+        self.client.preload(preload).await
     }
 }
 
@@ -367,12 +389,17 @@ impl<P1: Provider, P2: Provider> Provider for (P1, P2) {
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error> {
         self.0.put(data).await
     }
+
+    async fn preload(&self, preload: proto::Preload) -> Result<(), Error> {
+        self.0.preload(preload).await
+    }
 }
 
 /// A provider wrapper that caches data locally.
 pub struct Cached<P> {
     state: Arc<CachedState<P>>,
     prefetch_depth: u32,
+    preload_behavior: PreloadBehavior,
 }
 
 /// Constant cost associated with every entry in the page cache.
@@ -473,6 +500,19 @@ enum DiskCacheTask {
     Shutdown,
 }
 
+struct PreloadPageRequest {
+    timestamp: Instant,
+    result_tx: async_channel::Sender<anyhow::Result<PreloadPageResult>>,
+    hash: String,
+    n: u64,
+}
+
+enum PreloadPageResult {
+    Expired,
+    CacheHit,
+    CacheMiss(usize),
+}
+
 struct CachedState<P> {
     inner: P,
     page_cache: Mutex<PageCache>,
@@ -484,6 +524,12 @@ struct CachedState<P> {
     diskcache_pending_write_cache: Mutex<PageCache>,
     diskcache_write_threads: usize,
     diskcache_write_queue_tx: flume::Sender<DiskCacheTask>,
+    preload_tx: async_channel::Sender<PreloadPageRequest>,
+    preload_rx: async_channel::Receiver<PreloadPageRequest>,
+    preload_timeout: Duration,
+    preload_concurrency: usize,
+    preload_started: AtomicBool,
+    shutdown: AtomicBool,
 }
 
 /// Stats of `CachedState`
@@ -504,6 +550,23 @@ pub struct CacheStats {
 
     /// Cache disk usage in bytes
     pub disk_used_bytes: u64,
+
+    /// Pages pending preloading
+    pub preload_pages_pending: u64,
+}
+
+/// Preloading request handling configuration for `Cached` providers
+#[derive(Debug, Default)]
+pub enum PreloadBehavior {
+    /// Disabled, do not perform any preloading and do not forward
+    #[default]
+    Noop,
+
+    /// Forward the request without performing any preloading
+    Forward,
+
+    /// Perform preloading
+    Perform,
 }
 
 /// Configuration for a `Cached` provider.
@@ -533,6 +596,25 @@ pub struct CacheConfig<P: Provider + 'static> {
     /// Prefetch the N-ahead chunk. Setting to 0 implies no prefetching.
     #[builder(default = "0")]
     pub prefetch_depth: u32,
+
+    /// Configures how preloading requests should be handled.
+    pub preload_behavior: PreloadBehavior,
+
+    /// The maxium preloading concurrency
+    #[builder(default = "32")]
+    pub preload_concurrency: usize,
+
+    /// The maximum backlog of preloading pages. Defaults to 64K, which can
+    /// then accommodate either 32K small files (head is included) or
+    /// `64 * 1024 * <page size>` of data. With the default page size of
+    /// 2MiB this equals 128GiB.
+    #[builder(default = "64 * 1024")]
+    pub preload_max_pending_pages: usize,
+
+    /// The expiry timeout for chunk preloading requests. When pending chunk
+    /// preloading requests expire they are discarded without preloading.
+    #[builder(default = "Duration::from_secs(300)")]
+    pub preload_timeout: Duration,
 }
 
 impl<P: Provider + 'static> CacheConfig<P> {
@@ -547,6 +629,7 @@ impl<P: Provider + 'static> From<CacheConfig<P>> for Cached<P> {
     fn from(config: CacheConfig<P>) -> Self {
         assert!(config.pagesize >= 4096, "pagesize must be at least 4096");
         let (diskcache_write_queue_tx, diskcache_write_queue_rx) = flume::unbounded();
+        let (preload_tx, preload_rx) = async_channel::bounded(config.preload_max_pending_pages);
         let state = Arc::new(CachedState {
             inner: config.inner,
             page_cache: Default::default(),
@@ -560,6 +643,12 @@ impl<P: Provider + 'static> From<CacheConfig<P>> for Cached<P> {
             )),
             diskcache_write_threads: config.diskcache_write_concurrency,
             diskcache_write_queue_tx,
+            preload_tx,
+            preload_rx,
+            preload_timeout: config.preload_timeout,
+            preload_concurrency: config.preload_concurrency,
+            preload_started: Default::default(),
+            shutdown: Default::default(),
         });
         // Note: We spawn dedicated long-lived threads to perform disk cache writes.
         // Previously we spawned blocking tasks per chunk to flush it to disk,
@@ -577,12 +666,14 @@ impl<P: Provider + 'static> From<CacheConfig<P>> for Cached<P> {
         Self {
             state,
             prefetch_depth: config.prefetch_depth,
+            preload_behavior: config.preload_behavior,
         }
     }
 }
 
 impl<P> Drop for Cached<P> {
     fn drop(&mut self) {
+        self.state.shutdown.store(true, SeqCst);
         // Tell each writer thread to shut down
         for _ in 0..self.state.diskcache_write_threads {
             self.state
@@ -590,6 +681,8 @@ impl<P> Drop for Cached<P> {
                 .send(DiskCacheTask::Shutdown)
                 .ok();
         }
+        self.state.preload_tx.close();
+        self.state.preload_rx.close();
     }
 }
 
@@ -603,6 +696,7 @@ impl<P: Provider + 'static> Cached<P> {
             .inner(inner)
             .dir(dir.as_ref())
             .pagesize(pagesize)
+            .preload_behavior(PreloadBehavior::Noop)
             .build()
             .unwrap()
             .into_provider()
@@ -801,7 +895,7 @@ impl<P: Provider + 'static> CachedState<P> {
     }
 
     fn _disk_cache_populator(self: &Arc<Self>, rx: flume::Receiver<DiskCacheTask>) {
-        loop {
+        while !self.shutdown.load(SeqCst) {
             match rx.recv() {
                 Ok(DiskCacheTask::WriteBlob(r)) => self._populate_disk_cache(r.hash, r.n, r.len),
                 Ok(DiskCacheTask::Shutdown) => return,
@@ -941,6 +1035,7 @@ impl<P: Provider + 'static> CachedState<P> {
                 "cache.pending_disk_write_pages",
                 stats.pending_disk_write_pages
             );
+            statsd_gauge!("cache.preload.pages_pending", stats.preload_pages_pending);
         }
     }
 
@@ -959,9 +1054,195 @@ impl<P: Provider + 'static> CachedState<P> {
             pending_disk_write_bytes: self.diskcache_pending_write_bytes.load(Relaxed),
             pending_disk_write_pages: self.diskcache_pending_write_pages.load(Relaxed),
             pending_requests: self.pending_requests.lock().len() as u64,
+            preload_pages_pending: self.preload_tx.len() as u64,
             disk_total_bytes,
             disk_used_bytes,
         }
+    }
+
+    /// Preload a single blob chunk into cache
+    async fn preload_chunk(
+        self: &Arc<Self>,
+        hash: String,
+        n: u64,
+    ) -> anyhow::Result<PreloadPageResult> {
+        // Skip reading chunk if it is already cached on disk to avoid polluting
+        // page cache with data that might never be read.
+        let disk_path = self.page_disk_path(&hash, n)?;
+        if disk_path.exists() {
+            return Ok(PreloadPageResult::CacheHit);
+        }
+
+        // Fetch and write chunk to disk cache
+        let n_bytes = if n == 0 {
+            self.get_cached_size(&hash).await?;
+            8
+        } else {
+            self.get_single_cached_chunk(&hash, n, self.pagesize)
+                .await?
+                .len()
+        };
+        Ok(PreloadPageResult::CacheMiss(n_bytes))
+    }
+
+    /// Preload queued blob chunks into cache
+    async fn preloader(self: Arc<Self>, rx: async_channel::Receiver<PreloadPageRequest>) {
+        while !self.shutdown.load(SeqCst) {
+            match rx.recv().await {
+                Ok(PreloadPageRequest {
+                    timestamp,
+                    result_tx,
+                    hash,
+                    n,
+                }) => {
+                    let deadline = timestamp + self.preload_timeout;
+                    let result = if deadline < Instant::now() {
+                        Ok(PreloadPageResult::Expired)
+                    } else {
+                        self.preload_chunk(hash, n).await
+                    };
+                    result_tx.send(result).await.ok();
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Lazily start preloading tasks.
+    /// Must be called in the context of a tokio runtime.
+    fn spawn_preloader(self: &Arc<Self>) {
+        // Note(dano): Eagerly starting these tasks during construction is not possible
+        //             as there might not be a Tokio runtime.
+        if self
+            .preload_started
+            .compare_exchange(false, true, SeqCst, SeqCst)
+            .is_ok()
+        {
+            for _ in 0..self.preload_concurrency {
+                task::spawn(self.clone().preloader(self.preload_rx.clone()));
+            }
+        }
+    }
+
+    /// Preload blobs into cache
+    async fn preload(self: Arc<Self>, preload: proto::Preload) -> Result<(), Error> {
+        self.spawn_preloader();
+
+        let start = Instant::now();
+        let page_size = self.pagesize;
+
+        let blobs_total = preload.blobs.len();
+
+        #[derive(Default)]
+        struct Stats {
+            cache_misses: usize,
+            cache_hits: usize,
+            bytes_loaded: usize,
+            pages_successful: usize,
+            pages_failed: usize,
+            pages_expired: usize,
+        }
+
+        async fn preload_stats(
+            result_rx: async_channel::Receiver<anyhow::Result<PreloadPageResult>>,
+        ) -> Stats {
+            let mut stats = Stats::default();
+            while let Ok(r) = result_rx.recv().await {
+                match r {
+                    Ok(r) => {
+                        stats.pages_successful += 1;
+                        match r {
+                            PreloadPageResult::CacheHit => {
+                                stats.cache_hits += 1;
+                            }
+                            PreloadPageResult::CacheMiss(bytes_loaded) => {
+                                stats.cache_misses += 1;
+                                stats.bytes_loaded += bytes_loaded;
+                            }
+                            PreloadPageResult::Expired => {
+                                stats.pages_expired += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        stats.pages_failed += 1;
+                        eprintln!("failed to preload: {e}");
+                    }
+                }
+            }
+            stats
+        }
+
+        let blob_num_pages: Vec<_> = preload
+            .blobs
+            .iter()
+            .map(|proto::preload::Blob { hash, size }| {
+                let pages = size / page_size + if size % page_size > 0 { 1 } else { 0 };
+                let pages = pages + 1; // Include header
+                (hash.to_string(), pages)
+            })
+            .collect();
+
+        let pages_total: u64 = blob_num_pages.iter().map(|(_, pages)| pages).sum();
+
+        let pages = blob_num_pages
+            .iter()
+            .flat_map(|(hash, pages)| (0..*pages).map(|page| (hash.to_string(), page)));
+
+        let (result_tx, result_rx) = async_channel::unbounded();
+
+        let results_f = task::spawn(async move { preload_stats(result_rx).await });
+
+        let mut pages_enqueued = 0;
+
+        for (hash, n) in pages {
+            let result_tx = result_tx.clone();
+            match self.preload_tx.try_send(PreloadPageRequest {
+                timestamp: start,
+                result_tx,
+                hash,
+                n,
+            }) {
+                Ok(_) => {
+                    pages_enqueued += 1;
+                }
+                Err(Full(_)) => {
+                    eprintln!("preload queue full, discarding remaining preloading requests");
+                    break;
+                }
+                Err(Closed(_)) => {
+                    break;
+                }
+            }
+        }
+        drop(result_tx);
+
+        let end = Instant::now();
+        let latency: Duration = end - start;
+        statsd_distribution!("cache.preload.latency", latency.as_secs_f64());
+
+        match results_f.await {
+            Ok(stats) => {
+                let pages_throughput = stats.pages_successful as f64 / latency.as_secs_f64();
+                let bytes_throughput = stats.bytes_loaded as f64 / latency.as_secs_f64();
+                let pages_discarded = pages_total - pages_enqueued;
+                statsd_distribution!("cache.preload.pages_total", pages_total as f64);
+                statsd_distribution!("cache.preload.blobs_total", blobs_total as f64);
+                statsd_distribution!("cache.preload.pages_enqueued", pages_enqueued as f64);
+                statsd_distribution!("cache.preload.pages_discarded", pages_discarded as f64);
+                statsd_distribution!("cache.preload.pages_loaded", stats.pages_successful as f64, "success" => "true");
+                statsd_distribution!("cache.preload.pages_loaded", stats.pages_failed as f64, "success" => "false");
+                statsd_distribution!("cache.preload.pages_expired", stats.pages_expired as f64, "success" => "false");
+                statsd_distribution!("cache.preload.pages_throughput", pages_throughput, "success" => "true");
+                statsd_distribution!("cache.preload.bytes_loaded", stats.bytes_loaded as f64, "success" => "true");
+                statsd_distribution!("cache.preload.bytes_throughput", bytes_throughput, "success" => "true");
+            }
+            Err(e) => {
+                eprintln!("failed to get preloading stats: {e}");
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1102,6 +1383,22 @@ impl<P: Provider + 'static> Provider for Cached<P> {
 
     async fn put(&self, data: ReadStream<'_>) -> Result<String, Error> {
         self.state.inner.put(data).await
+    }
+
+    async fn preload(&self, preload: proto::Preload) -> Result<(), Error> {
+        match self.preload_behavior {
+            PreloadBehavior::Noop => Ok(()),
+            PreloadBehavior::Forward => self.state.inner.preload(preload).await,
+            PreloadBehavior::Perform => {
+                // TODO(dano): The preload command should perhaps also be forwarded so that
+                //             Cached providers further down the stack can preload at a
+                //             concurrency level suitable there.
+
+                let state = self.state.clone();
+                task::spawn(state.preload(preload));
+                Ok(())
+            }
+        }
     }
 }
 

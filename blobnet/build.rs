@@ -9,5 +9,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Generate version information for use in `blobnet --version`.
     shadow_rs::new()?;
 
+    // Build protobufs
+    prost_build::compile_protos(&["src/api.proto"], &["src/"])?;
+
     Ok(())
 }

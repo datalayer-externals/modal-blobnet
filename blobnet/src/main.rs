@@ -1,8 +1,10 @@
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use blobnet::client::FileClient;
+use blobnet::provider::PreloadBehavior::{Noop, Perform};
 use blobnet::provider::{self, Provider};
 use blobnet::server::{self, Config};
 use blobnet::statsd;
@@ -62,6 +64,45 @@ pub struct Cli {
     /// Disk cache write cache size limit in bytes.
     #[clap(long, env = "BLOBNET_DISKCACHE_WRITE_CACHE_LIMIT_BYTES", default_value_t = 64 * 1024 * 1024)]
     pub diskcache_pending_write_cache_limit_bytes: u64,
+
+    /// Concurrency level at which to fetch pages when performing bulk
+    /// preloading.
+    #[clap(
+        long,
+        env = "BLOBNET_DISKCACHE_PRELOAD_CONCURRENCY",
+        default_value_t = 32
+    )]
+    pub diskcache_preload_concurrency: usize,
+
+    /// Disable disk cache bulk preloading.
+    #[clap(
+        long,
+        env = "BLOBNET_DISKCACHE_PRELOAD_DISABLED",
+        default_value_t = false
+    )]
+    pub diskcache_preload_disabled: bool,
+
+    /// Disk cache bulk preload timeout. A lower helps blobnet shed load when
+    /// congested at the cost of less ability to accommodate preloading bursts.
+    #[clap(
+        long,
+        env = "BLOBNET_DISKCACHE_PRELOAD_TIMEOUT_SECS",
+        default_value_t = 300.0
+    )]
+    pub diskcache_preload_secs: f64,
+
+    /// Disk cache bulk preload max pending pages. When the preloading page
+    /// backlog reaches this threshold, additional pages are discarded
+    /// instead of being enqueued. Defaults to 64K, which can then
+    /// accommodate either 32K small files (head is included) or
+    /// `64 * 1024 * <page size>` of data. With the default page size of
+    /// 2 MiB this equals 128 GiB.
+    #[clap(
+        long,
+        env = "BLOBNET_DISKCACHE_PRELOAD_MAX_PENDING_PAGES",
+        default_value_t = 64 * 1024
+    )]
+    pub diskcache_preload_max_pending_pages: usize,
 }
 
 #[global_allocator]
@@ -122,6 +163,14 @@ async fn main() -> Result<()> {
             .diskcache_pending_write_cache_limit_bytes(
                 args.diskcache_pending_write_cache_limit_bytes,
             )
+            .preload_concurrency(args.diskcache_preload_concurrency)
+            .preload_behavior(if args.diskcache_preload_disabled {
+                Noop
+            } else {
+                Perform
+            })
+            .preload_timeout(Duration::from_secs_f64(args.diskcache_preload_secs))
+            .preload_max_pending_pages(args.diskcache_preload_max_pending_pages)
             .build()?
             .into_provider();
         tokio::spawn(caching.cleaner());

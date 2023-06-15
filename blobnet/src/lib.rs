@@ -145,6 +145,12 @@ mod headers {
     pub const HEADER_FILE_LENGTH: HeaderName = HeaderName::from_static("x-bn-file-length");
 }
 
+/// Protobuf message used in the server api
+#[allow(missing_docs)]
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/blobnet.api.rs"));
+}
+
 /// Internal type alias for a byte range.
 type BlobRange = Option<(u64, u64)>;
 

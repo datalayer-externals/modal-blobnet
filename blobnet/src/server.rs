@@ -15,9 +15,11 @@ use hyper::header::HeaderValue;
 use hyper::server::accept::Accept;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode, Version};
+use prost::Message;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::headers::{HEADER_FILE_LENGTH, HEADER_RANGE, HEADER_SECRET};
+use crate::proto;
 use crate::provider::Provider;
 use crate::utils::{body_stream, get_hash, stream_body};
 use crate::{make_resp, BlobRange, Error, ReadStream};
@@ -138,6 +140,14 @@ async fn _handle(
             let body = req.into_body();
             let hash = ctx.config.provider.put(body_stream(body)).await?;
             Ok(Response::new(Body::from(hash)))
+        }
+        (&Method::POST, "/preload") => {
+            let bytes = hyper::body::to_bytes(req.into_body())
+                .await
+                .map_err(|e| Error::Internal(e.into()))?;
+            let preload = proto::Preload::decode(bytes).map_err(|e| Error::Internal(e.into()))?;
+            ctx.config.provider.preload(preload).await?;
+            Ok(Response::new(Body::empty()))
         }
         _ => Err(make_resp(StatusCode::NOT_FOUND, "invalid request path")),
     }

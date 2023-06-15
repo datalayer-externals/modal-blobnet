@@ -10,12 +10,13 @@ use hyper::client::{connect::Connect, HttpConnector};
 use hyper::{Body, Client, HeaderMap, Request, StatusCode};
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use named_retry::Retry;
+use prost::Message;
 
 use crate::headers::{HEADER_FILE_LENGTH, HEADER_RANGE, HEADER_SECRET};
 #[cfg(doc)]
 use crate::provider::Remote;
 use crate::utils::body_stream;
-use crate::{BlobRange, BlobRead, Error};
+use crate::{proto, BlobRange, BlobRead, Error};
 
 /// hyper's client strictly maintains a single HTTP/2 connection
 /// to a HOST:PORT destination, multiplexing new HTTP requests onto
@@ -237,5 +238,18 @@ impl<C: Connect + Clone + Send + Sync + 'static> FileClient<C> {
         Ok(std::str::from_utf8(&bytes)
             .map_err(anyhow::Error::from)?
             .into())
+    }
+
+    /// Have remote server preload a list of blobs into cache.
+    pub async fn preload(&self, preload: proto::Preload) -> Result<(), Error> {
+        let make_req = || async {
+            Ok(Request::builder()
+                .method("POST")
+                .uri(&format!("{}/preload", self.origin))
+                .header(HEADER_SECRET, &self.secret)
+                .body(Body::from(preload.encode_to_vec()))?)
+        };
+        let _ = self.request_with_retry(make_req).await?;
+        Ok(())
     }
 }
