@@ -149,9 +149,13 @@ async fn request_cancellation() -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_cleaner() -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        eprintln!("Not on linux, skipping test");
+        return Ok(());
+    }
+
     if let Err(e) = Command::new("sudo").arg("-v").output().await {
         eprintln!("Unable to sudo, skipping test: {e}");
         return Ok(());
