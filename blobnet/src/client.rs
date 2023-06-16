@@ -131,6 +131,10 @@ impl FileClient<HttpsConnector<HttpConnector>> {
 impl<C: Connect + Clone + Send + Sync + 'static> FileClient<C> {
     /// Create a new file client object pointing at a given origin.
     pub fn new(connector: C, origin: &str, secret: &str, num_clients: u32) -> Self {
+        assert!(
+            !origin.ends_with('/'),
+            "origin must not include trailing slash"
+        );
         FileClient {
             client_pool: ClientPool::new(connector, num_clients),
             origin: origin.into(),
