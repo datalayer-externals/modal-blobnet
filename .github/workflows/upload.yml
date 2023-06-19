@@ -24,6 +24,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+
       - run: cargo build --release --bin blobnet
 
       - run: cargo build --release --bin blobnet --target aarch64-unknown-linux-gnu
