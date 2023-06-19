@@ -40,7 +40,7 @@ parking_lot = "0.12.1"
 prost = "0.11.9"
 rustls = "0.21.1"
 scopeguard = "1.1.0"
-sha2 = "0.10.2"
+sha2 = { version = "0.10.7", features = ["asm", "asm-aarch64"] }
 shadow-rs = "0.21.0"
 shutdown = "0.2.1"
 tempfile = "3.3.0"
@@ -63,4 +63,8 @@ prost-build = "0.11.9"
 
 [[bench]]
 name = "read_benchmark"
+harness = false
+
+[[bench]]
+name = "sha256_benchmark"
 harness = false
